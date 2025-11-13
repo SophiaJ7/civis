@@ -561,7 +561,7 @@ class VirmenTank:
         import os
         from bokeh.plotting import figure
         from bokeh.layouts import LayoutDOM
-        from bokeh.io import output_notebook, output_file, reset_output, export_svg, save, show, curdoc
+        from bokeh.io import output_notebook, output_file, reset_output, export_svg, export_png, save, show, curdoc
 
         def set_figures_backend(obj, backend):
             """Recursively set the output_backend of all figure objects"""
@@ -599,18 +599,26 @@ class VirmenTank:
             if os.path.exists(save_path) and not overwrite:
                 print("File already exists and overwrite is set to False.")
             else:
+                # Create directory structure if it doesn't exist
+                directory = os.path.dirname(save_path)
+                if directory and not os.path.exists(directory):
+                    os.makedirs(directory, exist_ok=True)
+                    print(f"Created directory: {directory}")
+                
                 # Set font sizes for all output formats if font_size is specified
                 if font_size is not None:
                     set_font_sizes(plot, font_size)
                 
-                if save_path.split(".")[-1] == 'html':
+                file_extension = save_path.split(".")[-1].lower()
+                
+                if file_extension == 'html':
                     output_file(save_path, title=title)
                     curdoc().clear()
                     curdoc().add_root(plot)
                     save(curdoc())
                     print("File saved as html.")
                     curdoc().clear()
-                elif save_path.split(".")[-1] == 'svg':
+                elif file_extension == 'svg':
                     # set all figures to SVG backend
                     set_figures_backend(plot, 'svg')
                     
@@ -620,8 +628,15 @@ class VirmenTank:
                     
                     # set back to canvas backend
                     set_figures_backend(plot, 'canvas')
+                elif file_extension == 'png':
+                    # set all figures to canvas backend for PNG export
+                    set_figures_backend(plot, 'canvas')
+                    
+                    # export PNG
+                    export_png(plot, filename=save_path)
+                    print("Plot successfully saved as png.")
                 else:
-                    raise ValueError("Invalid file type.")
+                    raise ValueError("Invalid file type. Supported formats are: html, svg, png")
 
         if notebook:
             reset_output()
@@ -723,6 +738,168 @@ class VirmenTank:
 
         return layout
 
+    def plot_summary_trajectory(self, title="Summary Trajectory", notebook=False, save_path=None, overwrite=False, font_size=None):
+        """
+        Plot summary trajectory showing all trials overlaid for the current maze type.
+        
+        Parameters:
+        -----------
+        title : str, optional
+            Title for the plot
+        notebook : bool, optional
+            Whether to display the plot in a notebook
+        save_path : str, optional
+            Path to save the plot
+        overwrite : bool, optional
+            Whether to overwrite existing files
+        font_size : str, optional
+            Font size for plot elements
+            
+        Returns:
+        --------
+        bokeh plot
+            The generated trajectory visualization
+        """
+        from bokeh.plotting import figure
+        from bokeh.models import ColumnDataSource, HoverTool
+        from bokeh.palettes import Category10
+        import numpy as np
+        
+        # Set figure dimensions based on maze type
+        if self.maze_type.lower() in ['turnv0', 'turnv1']:
+            # Turn mazes are wider and more square
+            width, height = 600, 600
+        elif self.maze_type.lower() in ['straight70v3']:
+            # Straight70v3 is narrower and taller
+            width, height = 400, 800
+        else:
+            # Other straight mazes are narrow and tall
+            width, height = 350, 800
+        
+        # Create figure
+        p = figure(title=f"{title} - {self.maze_type.upper()}", width=width, height=height,
+                  active_drag='pan', active_scroll='wheel_zoom')
+        
+        # Plot individual trials
+        colors = Category10[10]
+        for i, trial in enumerate(self.virmen_trials):
+            if len(trial['x']) > 0:  # Only plot non-empty trials
+                color = colors[i % len(colors)]
+                alpha = 0.6 if len(self.virmen_trials) > 10 else 0.8
+                
+                # Create trial source
+                trial_source = ColumnDataSource(data={
+                    'x': trial['x'],
+                    'y': trial['y'],
+                    'trial': [i] * len(trial['x'])
+                })
+                
+                p.line('x', 'y', source=trial_source, line_color=color, 
+                      line_width=1, alpha=alpha, legend_label=f'Trial {i+1}')
+        
+        # Add overall trajectory (all data points)
+        all_source = ColumnDataSource(data={
+            'x': self.virmen_data['x'],
+            'y': self.virmen_data['y'],
+            'index': list(range(len(self.virmen_data)))
+        })
+        
+        # Plot maze boundaries based on maze type
+        self._add_maze_boundaries(p)
+        
+        # Add trial end points
+        if len(self.trials_end_indices) > 0:
+            end_x = [self.virmen_data['x'].iloc[idx] for idx in self.trials_end_indices if idx < len(self.virmen_data)]
+            end_y = [self.virmen_data['y'].iloc[idx] for idx in self.trials_end_indices if idx < len(self.virmen_data)]
+            
+            end_source = ColumnDataSource(data={
+                'x': end_x,
+                'y': end_y,
+                'trial_num': list(range(len(end_x)))
+            })
+            
+            p.scatter('x', 'y', source=end_source, color='red', size=8,
+                    legend_label='Trial Ends', alpha=0.8)
+        
+        # Add hover tool
+        hover = HoverTool(tooltips=[
+            ("Position", "(@x, @y)"),
+            ("Trial", "@trial"),
+            ("Index", "@index")
+        ])
+        p.add_tools(hover)
+        
+        # Configure plot appearance
+        p.legend.location = "top_left"
+        p.legend.click_policy = "hide"
+        p.grid.grid_line_color = "lightgray"
+        p.axis.axis_line_color = "black"
+        p.axis.major_tick_line_color = "black"
+        p.axis.minor_tick_line_color = "gray"
+        p.xaxis.axis_label = "X Position (cm)"
+        p.yaxis.axis_label = "Y Position (cm)"
+        
+        # Make legend more readable for many trials
+        if len(self.virmen_trials) > 10:
+            p.legend.visible = False
+        
+        # Output the plot
+        self.output_bokeh_plot(p, save_path=save_path, title=title,
+                             notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return p
+    
+    def _add_maze_boundaries(self, plot):
+        """
+        Add maze boundary lines based on maze type.
+        
+        Parameters:
+        -----------
+        plot : bokeh figure
+            The plot to add boundaries to
+        """
+        # Get data range for boundary lines
+        x_data = self.virmen_data['x']
+        y_data = self.virmen_data['y']
+        x_range = [min(x_data), max(x_data)]
+        y_range = [min(y_data), max(y_data)]
+        
+        if self.maze_type.lower() == 'straight25':
+            # Add horizontal boundary lines at ±25
+            plot.line(x_range, [25, 25], line_color='black', line_width=2, 
+                     line_dash='dashed', legend_label='Maze Boundary')
+            plot.line(x_range, [-25, -25], line_color='black', line_width=2, 
+                     line_dash='dashed')
+                     
+        elif self.maze_type.lower() == 'straight50':
+            # Add horizontal boundary lines at ±50
+            plot.line(x_range, [50, 50], line_color='black', line_width=2, 
+                     line_dash='dashed', legend_label='Maze Boundary')
+            plot.line(x_range, [-50, -50], line_color='black', line_width=2, 
+                     line_dash='dashed')
+                     
+        elif self.maze_type.lower() in ['straight70', 'straight70v3']:
+            # Add horizontal boundary lines at ±70
+            plot.line(x_range, [70, 70], line_color='black', line_width=2, 
+                     line_dash='dashed', legend_label='Maze Boundary')
+            plot.line(x_range, [-70, -70], line_color='black', line_width=2, 
+                     line_dash='dashed')
+                     
+        elif self.maze_type.lower() in ['turnv0', 'turnv1']:
+            # Add boundary lines for turn maze (|x| + |y| = 175)
+            # Create boundary points
+            boundary_points = []
+            for angle in np.linspace(0, 2*np.pi, 100):
+                x = 175 * np.cos(angle)
+                y = 175 * np.sin(angle)
+                if abs(x) + abs(y) <= 175:
+                    boundary_points.append((x, y))
+            
+            if boundary_points:
+                boundary_x, boundary_y = zip(*boundary_points)
+                plot.line(boundary_x, boundary_y, line_color='black', line_width=2,
+                         line_dash='dashed', legend_label='Maze Boundary')
+
 
 class MazeV3Tank():
     def __init__(self, trials, data):
@@ -731,69 +908,274 @@ class MazeV3Tank():
         self.fall_indices = self.detect_falls()
         self.fall_count = len(self.fall_indices)
         
-    def detect_falls(self, edge_threshold=20, pause_threshold=0.5):
+        # Discriminate between left and right falls
+        self.left_fall_indices, self.right_fall_indices = self.classify_fall_directions()
+        self.left_fall_count = len(self.left_fall_indices)
+        self.right_fall_count = len(self.right_fall_indices)
+        
+        # Enhanced trial tracking
+        self.enhanced_trials = self.detect_enhanced_trials()
+        self.enhanced_trial_start_indices = [trial['start_idx'] for trial in self.enhanced_trials]
+        self.enhanced_trial_end_indices = [trial['end_idx'] for trial in self.enhanced_trials]
+        self.trial_outcomes = [trial['outcome'] for trial in self.enhanced_trials]
+        self.success_count = sum(1 for outcome in self.trial_outcomes if outcome == 'success')
+        self.failure_count = sum(1 for outcome in self.trial_outcomes if outcome == 'failure')
+        self.left_failure_count = sum(1 for outcome in self.trial_outcomes if outcome == 'left_failure')
+        self.right_failure_count = sum(1 for outcome in self.trial_outcomes if outcome == 'right_failure')
+        self.total_enhanced_trials = len(self.enhanced_trials)
+        
+    def detect_falls(self, x_boundary=20, y_success_threshold=70, jump_threshold=10, 
+                     freeze_threshold=0.5, max_lookback=1000):
         """
-        Detects instances where the animal falls off the edge in straight70v3 maze.
+        Lookback fall start detection method
+        
+        Detection logic:
+        1. First find fall end moments (large position jump + pre-jump out-of-bounds and unsuccessful)
+        2. From end moment, look back to find when position started freezing
+        3. Return fall start moment indices
         
         Parameters:
         -----------
-        edge_threshold : float
-            The position threshold (±) to consider as falling off the edge
-        pause_threshold : float
-            The threshold for position change rate to detect pauses in position updates
+        x_boundary : float
+            X-direction boundary threshold, default 20cm
+        y_success_threshold : float  
+            Y-direction success threshold, default 70cm
+        jump_threshold : float
+            Position jump threshold, default 10cm
+        freeze_threshold : float
+            Position freeze detection threshold, default 0.5cm
+        max_lookback : int
+            Maximum lookback frames, default 100 frames
             
         Returns:
         --------
         fall_indices : list
-            Indices in the data where falls were detected
+            List of fall start moment indices
         """
-        fall_indices = []
         x_positions = np.array(self.virmen_data['x'])
         y_positions = np.array(self.virmen_data['y'])
         
-        # Calculate position changes
+        # Calculate frame-by-frame position changes
         dx = np.diff(x_positions)
         dy = np.diff(y_positions)
         position_changes = np.sqrt(dx**2 + dy**2)
+        position_changes = np.append([0], position_changes)  # Pad to match length
         
-        # Pad the position_changes array to match the length of the positions
-        position_changes = np.append(position_changes, 0)
+        # Step 1: Find fall end moments
+        fall_end_indices = []
         
-        # Flag to track if we've already detected a fall at the current position
-        in_fall_state = False
-        
-        for i in range(1, len(self.virmen_data)):
-            # Check if position is at edge (±edge_threshold)
-            at_edge = abs(abs(x_positions[i]) - edge_threshold) < 2 or abs(abs(y_positions[i]) - edge_threshold) < 2
-            
-            # Check if position update is paused (position change rate near zero)
-            paused = position_changes[i] < pause_threshold
-            
-            # Detect fall: at edge position and position updates paused
-            if at_edge and paused and not in_fall_state:
-                fall_indices.append(i)
-                in_fall_state = True
-            
-            # Reset fall state when animal starts moving again
-            elif in_fall_state and not paused:
-                in_fall_state = False
+        for i in range(1, len(x_positions)):
+            # Detect large position jumps
+            if position_changes[i] > jump_threshold:
+                previous_x = x_positions[i-1]
+                previous_y = y_positions[i-1]
                 
-        return fall_indices
+                # Confirm this is a fall, not trial success
+                was_outside_x = abs(previous_x) > x_boundary
+                was_not_successful = abs(previous_y) < y_success_threshold
+                
+                if was_outside_x and was_not_successful:
+                    fall_end_indices.append(i-1)
+        
+        # Step 2: Look back from each fall end moment to find start moment
+        fall_start_indices = []
+        
+        for end_idx in fall_end_indices:
+            # Look back to find when position started freezing
+            freeze_start_idx = end_idx
+            
+            for lookback in range(1, min(max_lookback, end_idx)):
+                check_idx = end_idx - lookback
+                
+                # Check position change at this frame
+                if position_changes[check_idx] > freeze_threshold:
+                    # Position still changing, hasn't started freezing yet
+                    freeze_start_idx = check_idx + 1
+                    break
+            
+            # Avoid adding duplicate nearby fall start moments
+            if (len(fall_start_indices) == 0 or 
+                freeze_start_idx - fall_start_indices[-1] > 20):
+                fall_start_indices.append(freeze_start_idx)
+        
+        return fall_start_indices
     
+    def classify_fall_directions(self):
+        """
+        Classify fall events into left and right falls based on x-position at fall moment.
+        
+        Returns:
+        --------
+        tuple
+            (left_fall_indices, right_fall_indices) - Lists of fall indices separated by direction
+        """
+        x_positions = np.array(self.virmen_data['x'])
+        
+        left_fall_indices = []
+        right_fall_indices = []
+        
+        for fall_idx in self.fall_indices:
+            if fall_idx < len(x_positions):
+                x_at_fall = x_positions[fall_idx]
+                if x_at_fall < 0:
+                    left_fall_indices.append(fall_idx)
+                else:
+                    right_fall_indices.append(fall_idx)
+        
+        return left_fall_indices, right_fall_indices
+    
+    def detect_enhanced_trials(self, x_boundary=20, y_success_threshold=70, jump_threshold=10, 
+                               freeze_threshold=0.5, max_lookback=1000):
+        """
+        Detect enhanced trials that separate based on both success and failure endpoints.
+        
+        This method creates a comprehensive trial structure that includes:
+        - Success trials: trials ending when animal reaches success threshold (±70cm in y)
+        - Failure trials: trials ending when animal falls (position jump after being out of bounds)
+        
+        Parameters:
+        -----------
+        x_boundary : float
+            X-direction boundary threshold, default 20cm
+        y_success_threshold : float  
+            Y-direction success threshold, default 70cm
+        jump_threshold : float
+            Position jump threshold, default 10cm
+        freeze_threshold : float
+            Position freeze detection threshold, default 0.5cm
+        max_lookback : int
+            Maximum lookback frames, default 1000 frames
+            
+        Returns:
+        --------
+        enhanced_trials : list
+            List of dictionaries containing trial information with keys:
+            - start_idx: Trial start index
+            - end_idx: Trial end index
+            - outcome: 'success' or 'failure'
+            - duration: Trial duration in frames
+            - trial_data: Dictionary containing x, y, and other data for this trial
+        """
+        x_positions = np.array(self.virmen_data['x'])
+        y_positions = np.array(self.virmen_data['y'])
+        
+        # Find success endpoints (reaching ±70cm in y direction)
+        success_indices = []
+        for i in range(len(y_positions)):
+            if abs(y_positions[i]) >= y_success_threshold:
+                success_indices.append(i)
+        
+        # Find failure endpoints using fall detection logic
+        fall_end_indices = []
+        
+        # Calculate frame-by-frame position changes
+        dx = np.diff(x_positions)
+        dy = np.diff(y_positions)
+        position_changes = np.sqrt(dx**2 + dy**2)
+        position_changes = np.append([0], position_changes)  # Pad to match length
+        
+        # Find fall end moments (position jumps after being out of bounds)
+        for i in range(1, len(x_positions)):
+            if position_changes[i] > jump_threshold:
+                previous_x = x_positions[i-1]
+                previous_y = y_positions[i-1]
+                
+                # Confirm this is a fall (out of x bounds and below success threshold)
+                was_outside_x = abs(previous_x) > x_boundary
+                was_not_successful = abs(previous_y) < y_success_threshold
+                
+                if was_outside_x and was_not_successful:
+                    fall_end_indices.append(i-1)  # Record the moment before jump
+        
+        # Combine and sort all endpoints, classifying failures by direction
+        all_endpoints = []
+        for idx in success_indices:
+            all_endpoints.append((idx, 'success'))
+        for idx in fall_end_indices:
+            # Classify failure direction based on x-position at fall moment
+            if idx < len(x_positions):
+                x_at_fall = x_positions[idx]
+                outcome = 'left_failure' if x_at_fall < 0 else 'right_failure'
+            else:
+                outcome = 'failure'  # fallback if index is out of bounds
+            all_endpoints.append((idx, outcome))
+        
+        # Sort by index to get chronological order
+        all_endpoints.sort(key=lambda x: x[0])
+        
+        # Create enhanced trials
+        enhanced_trials = []
+        current_start = 0
+        
+        for end_idx, outcome in all_endpoints:
+            if end_idx > current_start:  # Ensure we have a valid trial
+                # Extract trial data
+                trial_data = {}
+                for column in self.virmen_data.columns:
+                    trial_data[column] = list(self.virmen_data[column].iloc[current_start:end_idx+1])
+                
+                trial_info = {
+                    'start_idx': current_start,
+                    'end_idx': end_idx,
+                    'outcome': outcome,
+                    'duration': end_idx - current_start + 1,
+                    'trial_data': trial_data
+                }
+                enhanced_trials.append(trial_info)
+                
+                # Next trial starts after current endpoint
+                current_start = end_idx + 1
+        
+        # Handle remaining data if any (incomplete trial at the end)
+        if current_start < len(self.virmen_data) - 1:
+            trial_data = {}
+            for column in self.virmen_data.columns:
+                trial_data[column] = list(self.virmen_data[column].iloc[current_start:])
+                
+            # Determine outcome based on final position
+            final_y = y_positions[-1]
+            final_outcome = 'success' if abs(final_y) >= y_success_threshold else 'incomplete'
+            
+            trial_info = {
+                'start_idx': current_start,
+                'end_idx': len(self.virmen_data) - 1,
+                'outcome': final_outcome,
+                'duration': len(self.virmen_data) - current_start,
+                'trial_data': trial_data
+            }
+            enhanced_trials.append(trial_info)
+        
+        return enhanced_trials
+
     def get_fall_summary(self):
         """
-        Returns a summary of the falls detected in the session.
+        Returns a summary of the falls detected in the session, including directional fall statistics.
         
         Returns:
         --------
         dict
-            A dictionary containing fall statistics
+            A dictionary containing fall statistics including left/right falls
         """
         return {
             "total_falls": self.fall_count,
+            "left_falls": self.left_fall_count,
+            "right_falls": self.right_fall_count,
             "fall_indices": self.fall_indices,
+            "left_fall_indices": self.left_fall_indices,
+            "right_fall_indices": self.right_fall_indices,
+            "left_fall_rate": self.left_fall_count / self.fall_count if self.fall_count > 0 else 0,
+            "right_fall_rate": self.right_fall_count / self.fall_count if self.fall_count > 0 else 0,
             "average_trial_length": np.mean([len(trial['x']) for trial in self.virmen_trials]) if self.virmen_trials else 0,
-            "total_trials": len(self.virmen_trials)
+            "total_trials": len(self.virmen_trials),
+            "enhanced_trial_summary": {
+                "total_enhanced_trials": self.total_enhanced_trials,
+                "success_count": self.success_count,
+                "left_failure_count": self.left_failure_count,
+                "right_failure_count": self.right_failure_count,
+                "success_rate": self.success_count / self.total_enhanced_trials if self.total_enhanced_trials > 0 else 0,
+                "left_failure_rate": self.left_failure_count / self.total_enhanced_trials if self.total_enhanced_trials > 0 else 0,
+                "right_failure_rate": self.right_failure_count / self.total_enhanced_trials if self.total_enhanced_trials > 0 else 0
+            }
         }
     
     def plot_falls(self, save_path=None, title="Animal Falls in Maze", notebook=False, overwrite=False, font_size=None):
@@ -823,7 +1205,7 @@ class MazeV3Tank():
         source = ColumnDataSource(data={
             'x': self.virmen_data['x'],
             'y': self.virmen_data['y'],
-            'index': range(len(self.virmen_data))
+            'index': list(range(len(self.virmen_data)))
         })
         
         # Create fall data source
@@ -843,7 +1225,7 @@ class MazeV3Tank():
         p.line('x', 'y', source=source, line_color='navy', line_width=1, alpha=0.6)
         
         # Highlight falls
-        p.circle('x', 'y', source=fall_source, color='red', size=10, 
+        p.scatter('x', 'y', source=fall_source, color='red', size=10,
                 alpha=0.8, legend_label=f'Falls ({self.fall_count})')
         
         # Add hover tool

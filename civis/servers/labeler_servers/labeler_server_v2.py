@@ -38,16 +38,17 @@ def load_data(filename):
         C_deconvolved = np.transpose(data['C_deconvolved'][()])
         C_reraw = np.transpose(data['C_reraw'][()])
         centroids = np.transpose(data['centroids'][()])
-        virmenPath = data['virmenPath'][()].tobytes().decode('utf-16le')
+        C_extract = np.transpose(data['temporal_weights'][()])
+        virmenPath = None
 
         for i in range(Coor_cell_array.shape[1]):
             ref = Coor_cell_array[0, i]  # Get the reference
             coor_data = file[ref]  # Use the reference to access the data
             coor_matrix = np.array(coor_data)  # Convert to a NumPy array
 
-            Coor.append(np.transpose(coor_matrix))
+            Coor.append(coor_matrix)
 
-    return C, C_raw, Cn, ids, Coor, centroids, virmenPath, C_denoised, C_deconvolved, C_reraw
+    return C, C_raw, Cn, ids, Coor, centroids, virmenPath, C_denoised, C_deconvolved, C_reraw, C_extract
 
 
 def load_tiff_image(image_path, color="red"):
@@ -59,7 +60,6 @@ def load_tiff_image(image_path, color="red"):
     try:
         # Load the image
         gray_image = imread(image_path)
-        gray_image = np.transpose(gray_image)
         
         # Normalize to 0-1 range
         normalized_image = gray_image.astype(float) / gray_image.max()
@@ -90,10 +90,12 @@ def load_tiff_image(image_path, color="red"):
 
 
 def labeler_bkapp_v2(doc):
-    global C, C_raw, ids, labels, image_source, session_name, C_denoised, C_deconvolved, C_reraw
+    global C, C_raw, ids, labels, image_source, session_name, C_denoised, C_deconvolved, C_reraw, Coor_original, Cn_shape
     filename = ''
     labels = np.zeros((3, 3), dtype=bool)
     labels[:, 2] = True
+    Coor_original = None  # Store original coordinate data
+    Cn_shape = None  # Store image shape
 
     """
     ========================================================================================================================
@@ -331,6 +333,39 @@ def labeler_bkapp_v2(doc):
     toggle_unknown = Toggle(label="Show Unknown", button_type="success", active=True)
     toggle_discard = Toggle(label="Show Discard", button_type="success", active=True)
 
+    # Toggle for coordinate transformation (XY swap only; Y-flip is always applied)
+    toggle_transform = Toggle(label="Swap X-Y Coordinates", button_type="primary", active=False, disabled=True)
+
+    def apply_coordinate_transform(Coor_data, height, apply_xy_swap=True):
+        """
+        Apply coordinate transformation on mask coordinates
+        :param Coor_data: List of coordinate arrays for each neuron
+        :param height: Image height for y-axis flipping
+        :param apply_xy_swap: If True, swap x and y coordinates (diagonal transform);
+                              Y-axis flip is ALWAYS applied regardless (Bokeh requirement)
+        :return: Transformed x and y position lists
+        """
+        x_positions_all = []
+        y_positions_all = []
+
+        for i in range(len(Coor_data)):
+            if apply_xy_swap:
+                # Apply coordinate swap (diagonal transformation)
+                x_positions = Coor_data[i][:, 1]  # Swap: use column 1 for x
+                y_positions = Coor_data[i][:, 0]  # Swap: use column 0 for y
+            else:
+                # Use original column order (no swap)
+                x_positions = Coor_data[i][:, 0]  # Use column 0 for x
+                y_positions = Coor_data[i][:, 1]  # Use column 1 for y
+
+            x_positions_all.append(x_positions)
+            y_positions_all.append(y_positions)
+
+        # ALWAYS flip y-coordinates vertically (Bokeh coordinate system requirement)
+        y_positions_all = [[height - y for y in y_list] for y_list in y_positions_all]
+
+        return x_positions_all, y_positions_all
+
     def update_toggle_colors():
         """Update toggle button colors and labels based on their state"""
         for toggle, label_base in [(toggle_d1, "D1"), (toggle_d2, "D2"), 
@@ -349,6 +384,26 @@ def labeler_bkapp_v2(doc):
     toggle_cholinergic.on_change('active', lambda attr, old, new: toggle_callback(toggle_cholinergic))
     toggle_unknown.on_change('active', lambda attr, old, new: toggle_callback(toggle_unknown))
     toggle_discard.on_change('active', lambda attr, old, new: toggle_callback(toggle_discard))
+
+    def toggle_transform_callback(_attr, _old, new):
+        """Callback for XY coordinate swap toggle"""
+        if Coor_original is None or Cn_shape is None:
+            return  # Data not loaded yet
+
+        # Apply or remove XY coordinate swap (Y-flip always applied)
+        # Note: Button logic is inverted - active=True means DO swap
+        height, _width = Cn_shape
+        x_positions_all, y_positions_all = apply_coordinate_transform(Coor_original, height, new)
+
+        # Update spatial_source with transformed coordinates
+        spatial_source.data['xs'] = x_positions_all
+        spatial_source.data['ys'] = y_positions_all
+
+        # Update button appearance
+        toggle_transform.button_type = "success" if new else "primary"
+        toggle_transform.label = "X-Y Swapped" if new else "Original X-Y Order"
+
+    toggle_transform.on_change('active', toggle_transform_callback)
 
     def update_mask_visibility():
         """Update visibility of masks based on their labels and toggle states"""
@@ -556,8 +611,8 @@ def labeler_bkapp_v2(doc):
     ========================================================================================================================
     """
 
-    # Filename input
-    sessionname_input = TextInput(value=filename, title="SessionName:", width=400)
+    # Filename input (supports both session name and file path)
+    sessionname_input = TextInput(value=filename, title="Session Name or File Path:", width=400)
     load_data_button = Button(label="Load Data", button_type="success")
 
     def load_and_update_data(filename):
@@ -566,7 +621,7 @@ def labeler_bkapp_v2(doc):
         Then re-populate the spatial_source with new shapes and
         reset labels/data for all neurons to 'unknown' by default.
         """
-        global C, C_raw, ids, labels, image_source, C_denoised, C_deconvolved, C_reraw
+        global C, C_raw, ids, labels, image_source, C_denoised, C_deconvolved, C_reraw, Coor_original, Cn_shape
         # Enable navigation controls
         neuron_id_slider.disabled = False
         neuron_index_input.disabled = False
@@ -601,7 +656,14 @@ def labeler_bkapp_v2(doc):
         bfp_input.value = "m_f_n_001_bfp_max.tif"
 
         # Load the data
-        [C, C_raw, Cn, ids, Coor, centroids, virmenPath, C_denoised, C_deconvolved, C_reraw] = load_data(filename)
+        [C, C_raw, Cn, ids, Coor, centroids, virmenPath, C_denoised, C_deconvolved, C_reraw, C_extract] = load_data(filename)
+
+        # Store original coordinate data and image shape for coordinate transformation
+        Coor_original = Coor
+        Cn_shape = Cn.shape[:2]
+
+        # Enable coordinate transformation toggle
+        toggle_transform.disabled = False
 
         # Initialize labels as a dictionary with all neurons set to "unknown"
         labels = {str(i): "unknown" for i in range(len(C))}
@@ -609,19 +671,8 @@ def labeler_bkapp_v2(doc):
         num_shapes = len(Coor)
         height, width = Cn.shape[:2]
 
-        # Prepare data for Bokeh
-        x_positions_all = []
-        y_positions_all = []
-
-        for i in range(num_shapes):
-            x_positions = Coor[i][0]
-            y_positions = Coor[i][1]
-
-            # Close the shape by ensuring the first point is repeated at the end
-            x_positions_all.append(x_positions)
-            y_positions_all.append(y_positions)
-
-        y_positions_all = [[height - y for y in y_list] for y_list in y_positions_all]
+        # Apply coordinate transformation based on toggle state
+        x_positions_all, y_positions_all = apply_coordinate_transform(Coor, height, toggle_transform.active)
 
         colors = [custom_bright_colors[i % len(custom_bright_colors)] for i in range(num_shapes)]
 
@@ -706,10 +757,33 @@ def labeler_bkapp_v2(doc):
 
     def update_data():
         global session_name
-        with open(CONFIG_PATH, 'r') as file:
-            config = json.load(file)
-        session_name = sessionname_input.value
-        neuron_path = os.path.join(config['ProcessedFilePath'], session_name, f'{session_name}_v7.mat')
+        input_value = sessionname_input.value.strip()
+
+        # Auto-detect if input is a file path or session name
+        if "/" in input_value or "\\" in input_value or input_value.endswith('.mat'):
+            # Treat as file path
+            neuron_path = os.path.normpath(input_value)
+
+            # Check if it's an absolute path
+            if not os.path.isabs(neuron_path):
+                # If relative path, make it relative to the current working directory
+                neuron_path = os.path.abspath(neuron_path)
+
+            # Extract session name from the file path for saving labels
+            # Assume the session name is the parent directory name
+            session_name = os.path.basename(os.path.dirname(neuron_path))
+        else:
+            # Treat as session name (original behavior)
+            with open(CONFIG_PATH, 'r') as file:
+                config = json.load(file)
+            session_name = input_value
+            neuron_path = os.path.join(config['ProcessedFilePath'], session_name, f'{session_name}_v7.mat')
+
+        # Verify the file exists
+        if not os.path.exists(neuron_path):
+            status_div.text = f"<span style='color: red;'>Error: File not found at {neuron_path}</span>"
+            return
+
         load_and_update_data(neuron_path)
         print(f"{neuron_path} loaded!")
 
@@ -722,7 +796,7 @@ def labeler_bkapp_v2(doc):
     """
     # Create input fields for different image types with default filenames
     gcamp_input = TextInput(value=f"max.tif", title="GCaMP Max Projection", width=400)
-    orig_tdt_input = TextInput(value=f"m_f_n_001_tdt_max.tif", title="TDT (D2)", width=400)
+    orig_tdt_input = TextInput(value=f"m_f_n_001_tdt_max.tif", title="TDT (D1)", width=400)
     bfp_input = TextInput(value=f"m_f_n_001_bfp_max.tif", title="BFP (Cholinergic)", width=400)
 
     gcamp_input.disabled = True
@@ -741,33 +815,49 @@ def labeler_bkapp_v2(doc):
     def load_specific_image(image_type, image_input):
         """
         Load a specific image type (GCaMP, original TDT, or adjusted TDT)
+        Supports both absolute paths and relative paths within the session structure
         """
         try:
             # Save current view state
             current_x_range = (spatial.x_range.start, spatial.x_range.end)
             current_y_range = (spatial.y_range.start, spatial.y_range.end)
 
-            with open(CONFIG_PATH, 'r') as file:
-                config = json.load(file)
+            input_value = image_input.value
+            
+            # Check if the input contains path separators (absolute or relative path)
+            if "/" in input_value or "\\" in input_value:
+                # Treat as absolute or relative path
+                image_path = input_value
+                # Convert forward slashes to platform-appropriate separators
+                image_path = os.path.normpath(image_path)
+            else:
+                # Treat as filename only - use existing folder structure
+                with open(CONFIG_PATH, 'r') as file:
+                    config = json.load(file)
 
-            session_name = sessionname_input.value
-            base_path = config['ProcessedFilePath']
+                session_name = sessionname_input.value
+                base_path = config['ProcessedFilePath']
 
-            # Construct the image path based on type
+                # Construct the image path based on type
+                if image_type == "gcamp":
+                    folder_name = f'{session_name}_tiff_projections'
+                    filename = input_value
+                    image_path = os.path.join(base_path, session_name, folder_name, filename)
+                elif image_type == "orig_tdt":
+                    folder_name = f'{session_name}_alignment_check'
+                    filename = input_value
+                    image_path = os.path.join(base_path, session_name, folder_name, filename)
+                elif image_type == "bfp":
+                    folder_name = f'{session_name}_alignment_check'
+                    filename = input_value
+                    image_path = os.path.join(base_path, session_name, folder_name, filename)
+
+            # Set color based on image type
             if image_type == "gcamp":
-                folder_name = f'{session_name}_tiff_projections'
-                filename = image_input.value
-                image_path = os.path.join(base_path, session_name, folder_name, filename)
                 color = "green"
             elif image_type == "orig_tdt":
-                folder_name = f'{session_name}_alignment_check'
-                filename = image_input.value
-                image_path = os.path.join(base_path, session_name, folder_name, filename)
                 color = "red"
             elif image_type == "bfp":
-                folder_name = f'{session_name}_alignment_check'
-                filename = image_input.value
-                image_path = os.path.join(base_path, session_name, folder_name, filename)
                 color = "blue"
 
             # Load and process the image
@@ -826,8 +916,7 @@ def labeler_bkapp_v2(doc):
         gcamp_row,
         orig_tdt_row,
         bfp_row,
-        row(remove_image_button),
-        status_div
+        row(remove_image_button)
     )
 
     """
@@ -913,6 +1002,9 @@ def labeler_bkapp_v2(doc):
     # Our new row of toggles:
     toggle_row = row(spacer3, toggle_d1, toggle_d2, toggle_cholinergic, toggle_unknown, toggle_discard)
 
+    # Coordinate transformation toggle in a separate row
+    transform_row = row(spacer3, toggle_transform)
+
     layout = row(
         column(
             spatial,
@@ -922,9 +1014,11 @@ def labeler_bkapp_v2(doc):
             choose_file,
             controls,
             toggle_row,
+            transform_row,
             temporal,
             labelling,
-            menus
+            menus,
+            status_div
         )
     )
 

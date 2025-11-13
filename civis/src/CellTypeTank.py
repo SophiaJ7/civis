@@ -1,7 +1,8 @@
 import os
 import numpy as np
 import pandas as pd
-from .CITank import CITank
+from civis.src.CITank import CITank
+from .NeuralConnectivityAnalyzer import NeuralConnectivityAnalyzer
 
 class CellTypeTank(CITank):
     """
@@ -131,11 +132,16 @@ class CellTypeTank(CITank):
     def _load_cell_type_labels(self, cell_type_label_file):
         """
         Load cell type labels from either a dictionary or a file.
+        Supports both absolute paths and relative paths within the session structure.
         
         Parameters:
         -----------
         cell_type_label_file : str
-            Path to a JSON/CSV file containing the labels
+            Path to a JSON file containing the labels. Can be:
+            - None: Uses default path {ProcessedFilePath}/{session_name}/{session_name}.json
+            - Absolute path: Uses the path directly (e.g., /path/to/labels.json)
+            - Relative path: Uses the path relative to current directory
+            - Filename only: Uses default folder structure with the filename
             
         Returns:
         --------
@@ -143,7 +149,16 @@ class CellTypeTank(CITank):
             Tuple containing arrays of indices for D1, D2, CHI, and unknown neurons
         """
         if cell_type_label_file is None:
+            # Default path when no file specified
             cell_type_label_file = os.path.join(self.config['ProcessedFilePath'], self.session_name, f"{self.session_name}.json")
+        elif isinstance(cell_type_label_file, str):
+            # Check if the input contains path separators (absolute or relative path)
+            if "/" not in cell_type_label_file and "\\" not in cell_type_label_file:
+                # Treat as filename only - use default folder structure
+                cell_type_label_file = os.path.join(self.config['ProcessedFilePath'], self.session_name, cell_type_label_file)
+            else:
+                # Treat as absolute or relative path and normalize it
+                cell_type_label_file = os.path.normpath(cell_type_label_file)
             
         if isinstance(cell_type_label_file, str):
             # Load from file based on extension
@@ -184,6 +199,7 @@ class CellTypeTank(CITank):
         """
         Plot average calcium traces for D1, D2, and/or CHI neuron populations, along with velocity, around specific events.
         Uses dual y-axes to separately scale calcium and velocity signals, with optimized scaling.
+        Includes error bands (shaded areas) showing ±1 standard deviation around the mean for each cell type.
         
         Parameters:
         -----------
@@ -251,19 +267,20 @@ class CellTypeTank(CITank):
         # Use provided title or generate default
         plot_title = title or default_title
         
-        # Calculate average signals around the event for each cell type
-        C_avg_mean_d1 = None
-        C_avg_mean_d2 = None
-        C_avg_mean_chi = None
-        
         if show_d1:
             [C_avg_d1, _, _, C_avg_mean_d1, _] = self.average_across_indices(indices, signal=d1_signal, cut_interval=cut_interval)
+            # Calculate standard deviation across neurons
+            C_avg_std_d1 = np.std(C_avg_d1, axis=0)
             
         if show_d2:
-            [_, _, _, C_avg_mean_d2, _] = self.average_across_indices(indices, signal=d2_signal, cut_interval=cut_interval)
+            [C_avg_d2, _, _, C_avg_mean_d2, _] = self.average_across_indices(indices, signal=d2_signal, cut_interval=cut_interval)
+            # Calculate standard deviation across neurons
+            C_avg_std_d2 = np.std(C_avg_d2, axis=0)
             
         if show_chi:
-            [_, _, _, C_avg_mean_chi, _] = self.average_across_indices(indices, signal=chi_signal, cut_interval=cut_interval)
+            [C_avg_chi, _, _, C_avg_mean_chi, _] = self.average_across_indices(indices, signal=chi_signal, cut_interval=cut_interval)
+            # Calculate standard deviation across neurons
+            C_avg_std_chi = np.std(C_avg_chi, axis=0)
         
         # Always include velocity
         [_, _, _, velocity_mean, _] = self.average_across_indices(indices, signal=self.smoothed_velocity, cut_interval=cut_interval)
@@ -272,18 +289,31 @@ class CellTypeTank(CITank):
         time_axis = (np.array(range(2 * cut_interval)) - cut_interval) / self.ci_rate
         
         # Calculate optimal y-axis ranges for calcium signals with padding
-        # Collect all the signals we're going to plot
+        # Collect all the signals we're going to plot (including error bands)
         all_ca_signals = []
-        if show_d1:
-            all_ca_signals.append(C_avg_mean_d1)
-        if show_d2:
-            all_ca_signals.append(C_avg_mean_d2)
-        if show_chi:
-            all_ca_signals.append(C_avg_mean_chi)
+        all_ca_upper = []
+        all_ca_lower = []
         
-        # Calculate min and max across all cell types
-        ca_min = min(signal.min() for signal in all_ca_signals)
-        ca_max = max(signal.max() for signal in all_ca_signals)
+        if show_d1 and C_avg_mean_d1 is not None and C_avg_std_d1 is not None:
+            all_ca_signals.append(C_avg_mean_d1)
+            all_ca_upper.append(C_avg_mean_d1 + C_avg_std_d1)
+            all_ca_lower.append(C_avg_mean_d1 - C_avg_std_d1)
+        if show_d2 and C_avg_mean_d2 is not None and C_avg_std_d2 is not None:
+            all_ca_signals.append(C_avg_mean_d2)
+            all_ca_upper.append(C_avg_mean_d2 + C_avg_std_d2)
+            all_ca_lower.append(C_avg_mean_d2 - C_avg_std_d2)
+        if show_chi and C_avg_mean_chi is not None and C_avg_std_chi is not None:
+            all_ca_signals.append(C_avg_mean_chi)
+            all_ca_upper.append(C_avg_mean_chi + C_avg_std_chi)
+            all_ca_lower.append(C_avg_mean_chi - C_avg_std_chi)
+        
+        # Calculate min and max across all cell types (including error bands)
+        if all_ca_lower and all_ca_upper:
+            ca_min = min(signal.min() for signal in all_ca_lower)
+            ca_max = max(signal.max() for signal in all_ca_upper)
+        else:
+            # Fallback if no signals to plot
+            ca_min, ca_max = -1, 1
         
         # Add padding to ensure the signals are well-positioned in the plot (10% padding)
         ca_range = ca_max - ca_min
@@ -291,8 +321,9 @@ class CellTypeTank(CITank):
         ca_max = ca_max + (ca_range * 0.1)
         
         # Create plot with optimized y-axis for calcium signals
-        p = figure(width=800, height=400, active_scroll="wheel_zoom", title=plot_title,
+        p = figure(width=1000, height=400, active_scroll="wheel_zoom", title=plot_title,
                    x_axis_label='Time (s)', y_axis_label='Calcium Signal (ΔF/F)',
+                   x_range=Range1d(-cut_interval/self.ci_rate, cut_interval/self.ci_rate),
                    y_range=Range1d(ca_min, ca_max))
         
         # Add secondary y-axis for velocity with its own optimized range
@@ -306,17 +337,32 @@ class CellTypeTank(CITank):
         # Add calcium traces and velocity to plot (without adding to legend)
         legend_items = []
         
-        if show_d1:
-            d1_line = p.line(time_axis, C_avg_mean_d1, line_width=3, color='navy', alpha=0.6)
-            legend_items.append(("D1", [d1_line]))
+        if show_d1 and C_avg_mean_d1 is not None and C_avg_std_d1 is not None:
+            # Add error band for D1
+            d1_band = p.patch(np.concatenate([time_axis, time_axis[::-1]]), 
+                             np.concatenate([C_avg_mean_d1 + C_avg_std_d1, (C_avg_mean_d1 - C_avg_std_d1)[::-1]]),
+                             alpha=0.2, color='navy', line_alpha=0)
+            # Add mean line for D1
+            d1_line = p.line(time_axis, C_avg_mean_d1, line_width=3, color='navy', alpha=0.8)
+            legend_items.append(("D1", [d1_line, d1_band]))
         
-        if show_d2:
-            d2_line = p.line(time_axis, C_avg_mean_d2, line_width=3, color='red', alpha=0.6)
-            legend_items.append(("D2", [d2_line]))
+        if show_d2 and C_avg_mean_d2 is not None and C_avg_std_d2 is not None:
+            # Add error band for D2
+            d2_band = p.patch(np.concatenate([time_axis, time_axis[::-1]]), 
+                             np.concatenate([C_avg_mean_d2 + C_avg_std_d2, (C_avg_mean_d2 - C_avg_std_d2)[::-1]]),
+                             alpha=0.2, color='red', line_alpha=0)
+            # Add mean line for D2
+            d2_line = p.line(time_axis, C_avg_mean_d2, line_width=3, color='red', alpha=0.8)
+            legend_items.append(("D2", [d2_line, d2_band]))
         
-        if show_chi:
-            chi_line = p.line(time_axis, C_avg_mean_chi, line_width=3, color='green', alpha=0.6)
-            legend_items.append(("CHI", [chi_line]))
+        if show_chi and C_avg_mean_chi is not None and C_avg_std_chi is not None:
+            # Add error band for CHI
+            chi_band = p.patch(np.concatenate([time_axis, time_axis[::-1]]), 
+                              np.concatenate([C_avg_mean_chi + C_avg_std_chi, (C_avg_mean_chi - C_avg_std_chi)[::-1]]),
+                              alpha=0.2, color='green', line_alpha=0)
+            # Add mean line for CHI
+            chi_line = p.line(time_axis, C_avg_mean_chi, line_width=3, color='green', alpha=0.8)
+            legend_items.append(("CHI", [chi_line, chi_band]))
         
         vel_line = p.line(time_axis, velocity_mean, line_width=3, color='gray', 
                          y_range_name="velocity_axis", alpha=0.6)
@@ -325,20 +371,20 @@ class CellTypeTank(CITank):
         # Create a legend outside the plot
         legend = Legend(
             items=legend_items,
-            location="center",
-            orientation="horizontal",
+            location="right",
+            orientation="vertical",
             click_policy="hide"
         )
         
         # Add the legend to the top of the plot (outside the plot area)
-        p.add_layout(legend, 'above')
+        p.add_layout(legend, 'right')
         
         # Style the plot
         p.xgrid.grid_line_color = None
         p.ygrid.grid_line_color = None
         
         # Add vertical line at time=0 (the event)
-        p.line([0, 0], [ca_min, ca_max], line_width=1, line_dash='dashed', color='black', alpha=0.7)
+        p.line([0, 0], [ca_min, ca_max], line_width=2, line_dash='dashed', color='black', alpha=0.7)
         
         # Output the plot
         cell_types = []
@@ -348,6 +394,389 @@ class CellTypeTank(CITank):
         cell_type_str = "_".join(cell_types)
         
         output_title = f"{plot_title} ({cell_type_str})" if cell_types else plot_title
+        self.output_bokeh_plot(p, save_path=save_path, title=output_title, notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return p
+
+    def plot_fluorescence_change_around_events(self, event_type='movement_onset', 
+                                                show_d1=True, show_d2=True, show_chi=True,
+                                                d1_signal=None, d2_signal=None, chi_signal=None,
+                                                analysis_type='change', time_window=(-2.0, 2.0),
+                                                baseline_window=(-2.0, -1.0), bin_size=1.0,
+                                                save_path=None, title=None, notebook=False, overwrite=False, font_size=None):
+        """
+        Analyze and plot fluorescence changes around specific behavioral events.
+        Can generate plots similar to paper Figure 2e (change analysis) and Figure 2g (time dynamics analysis).
+        
+        Parameters:
+        -----------
+        event_type : str
+            Type of behavioral event. Options: 'movement_onset', 'velocity_peak', 'movement_offset'
+        show_d1, show_d2, show_chi : bool
+            Whether to show the corresponding cell types
+        d1_signal, d2_signal, chi_signal : numpy.ndarray, optional
+            Cell signals. If None, uses default z-scored signals
+        analysis_type : str
+            Type of analysis. Options: 'change' (similar to 2e), 'dynamics' (similar to 2g)
+        time_window : tuple
+            Analysis time window in seconds (start, end)
+        baseline_window : tuple
+            Baseline window in seconds (start, end), only used for 'dynamics' analysis
+        bin_size : float
+            Time bin size in seconds, only used for 'dynamics' analysis
+        save_path, title, notebook, overwrite, font_size : 
+            Plotting parameters, same as previous functions
+        
+        Returns:
+        --------
+        bokeh.plotting.figure or tuple
+            If analysis_type='change', returns bar plot and statistical results
+            If analysis_type='dynamics', returns line plot
+        """
+        from bokeh.plotting import figure
+        from bokeh.models import LinearAxis, Range1d, Legend
+        import numpy as np
+        from scipy import stats
+        
+        # Select event indices based on event type
+        if event_type == 'movement_onset':
+            indices = self.movement_onset_indices
+            default_title_change = "Fluorescence Change at Movement Onset"
+            default_title_dynamics = "Fluorescence Dynamics around Movement Onset"
+        elif event_type == 'velocity_peak':
+            indices = self.velocity_peak_indices
+            default_title_change = "Fluorescence Change at Velocity Peak"
+            default_title_dynamics = "Fluorescence Dynamics around Velocity Peak"
+        elif event_type == 'movement_offset':
+            indices = self.movement_offset_indices
+            default_title_change = "Fluorescence Change at Movement Offset"
+            default_title_dynamics = "Fluorescence Dynamics around Movement Offset"
+        else:
+            raise ValueError("event_type must be one of: 'movement_onset', 'velocity_peak', 'movement_offset'")
+        
+        # Check that at least one cell type is shown
+        if not (show_d1 or show_d2 or show_chi):
+            raise ValueError("At least one of show_d1, show_d2, or show_chi must be True")
+        
+        # Set default signals if not provided
+        if show_d1 and d1_signal is None:
+            d1_signal = self.d1_zsc
+        if show_d2 and d2_signal is None:
+            d2_signal = self.d2_zsc
+        if show_chi and chi_signal is None:
+            chi_signal = self.chi_zsc
+        
+        # Calculate number of samples for time window
+        cut_interval = int(max(abs(time_window[0]), abs(time_window[1])) * self.ci_rate)
+        
+        # Extract data for each cell type (keep D1 and D2 separate)
+        cell_data = {}
+        cell_colors = {}
+        
+        if show_d1:
+            [C_avg_d1, _, _, C_avg_mean_d1, _] = self.average_across_indices(indices, signal=d1_signal, cut_interval=cut_interval)
+            cell_data['D1'] = {'individual': C_avg_d1, 'mean': C_avg_mean_d1}
+            cell_colors['D1'] = 'blue'
+        
+        if show_d2:
+            [C_avg_d2, _, _, C_avg_mean_d2, _] = self.average_across_indices(indices, signal=d2_signal, cut_interval=cut_interval)
+            cell_data['D2'] = {'individual': C_avg_d2, 'mean': C_avg_mean_d2}
+            cell_colors['D2'] = 'red'
+        
+        if show_chi:
+            [C_avg_chi, _, _, C_avg_mean_chi, _] = self.average_across_indices(indices, signal=chi_signal, cut_interval=cut_interval)
+            cell_data['CHI'] = {'individual': C_avg_chi, 'mean': C_avg_mean_chi}
+            cell_colors['CHI'] = 'green'
+        
+        # Create time axis in seconds
+        time_axis = (np.array(range(2 * cut_interval)) - cut_interval) / self.ci_rate
+        
+        if analysis_type == 'change':
+            return self._plot_fluorescence_change(cell_data, cell_colors, time_axis, time_window, 
+                                                title or default_title_change, save_path, notebook, overwrite, font_size)
+        elif analysis_type == 'dynamics':
+            return self._plot_fluorescence_dynamics(cell_data, cell_colors, time_axis, baseline_window, bin_size,
+                                                title or default_title_dynamics, save_path, notebook, overwrite, font_size)
+        else:
+            raise ValueError("analysis_type must be 'change' or 'dynamics'")
+
+    def _plot_fluorescence_change(self, cell_data, cell_colors, time_axis, time_window, title, save_path, notebook, overwrite, font_size):
+        """
+        Plot fluorescence change line plot (similar to Figure 2e)
+        Shows Pre vs Post event fluorescence with connecting lines
+        """
+        from bokeh.plotting import figure
+        from bokeh.models import Legend
+        from scipy import stats
+        import numpy as np
+        
+        # Define pre/post time window indices
+        pre_start_idx = np.argmin(np.abs(time_axis - (-1.0)))  # 1 second before event
+        pre_end_idx = np.argmin(np.abs(time_axis - 0.0))       # Event time
+        post_start_idx = np.argmin(np.abs(time_axis - 0.0))    # Event time
+        post_end_idx = np.argmin(np.abs(time_axis - 1.0))      # 1 second after event
+        
+        # Calculate changes for each cell type
+        results = {}
+        
+        # Create plot with categorical x-axis
+        x_categories = ['Pre', 'Post']
+        p = figure(x_range=x_categories, width=400, height=500, title=title,
+                x_axis_label='', y_axis_label='Mean population ΔF/F')
+        
+        legend_items = []
+        
+        for cell_type, data in cell_data.items():
+            individual_data = data['individual']
+            
+            # Calculate pre and post fluorescence means for each neuron
+            pre_values = np.mean(individual_data[:, pre_start_idx:pre_end_idx], axis=1)
+            post_values = np.mean(individual_data[:, post_start_idx:post_end_idx], axis=1)
+            
+            # Calculate population means and SEM
+            pre_mean = np.mean(pre_values)
+            post_mean = np.mean(post_values)
+            pre_sem = stats.sem(pre_values)
+            post_sem = stats.sem(post_values)
+            
+            # Statistical test for significance
+            change_values = post_values - pre_values
+            positive_changes = np.sum(change_values > 0)
+            total_neurons = len(change_values)
+            
+            # Use normal approximation for sign test
+            if total_neurons > 10:
+                expected = total_neurons / 2
+                se = np.sqrt(total_neurons * 0.5 * 0.5)
+                z_score = (positive_changes - expected) / se
+                p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
+            else:
+                try:
+                    from scipy.stats import binomtest
+                    result = binomtest(positive_changes, total_neurons, p=0.5, alternative='two-sided')
+                    p_value = result.pvalue
+                except ImportError:
+                    try:
+                        _, p_value = stats.binom_test(positive_changes, total_neurons, p=0.5, alternative='two-sided')
+                    except AttributeError:
+                        p_value = 1.0 if positive_changes == total_neurons // 2 else 0.05
+            
+            # Store results
+            results[cell_type] = {
+                'pre_mean': pre_mean,
+                'post_mean': post_mean,
+                'pre_sem': pre_sem,
+                'post_sem': post_sem,
+                'p_value': p_value,
+                'n_neurons': total_neurons,
+                'positive_count': positive_changes
+            }
+            
+            # Alternative approach: Plot error bars with proper caps using explicit coordinates
+            color = cell_colors[cell_type]
+            y_data = [pre_mean, post_mean]
+            y_err = [pre_sem, post_sem]
+            
+            # Store all renderers for this cell type
+            cell_renderers = []
+            
+            # Plot line connecting pre to post
+            line = p.line(x_categories, y_data, line_width=3, color=color, alpha=0.8)
+            cell_renderers.append(line)
+            
+            # Plot error bars and points with proper caps
+            cap_width = 0.1  # Width of the horizontal caps as fraction of category spacing
+            
+            for i, (x_cat, y_val, err) in enumerate(zip(x_categories, y_data, y_err)):
+                # Main vertical error bar
+                error_bar = p.line([x_cat, x_cat], [y_val - err, y_val + err], 
+                    line_width=2, color=color, alpha=0.8)
+                cell_renderers.append(error_bar)
+                
+                # Error bar caps (horizontal whiskers)
+                # For categorical axes, we need to use the actual category positions
+                x_pos = i+0.5  # 0 for 'Pre', 1 for 'Post'
+                x_left = x_pos - cap_width
+                x_right = x_pos + cap_width
+                
+                # Top cap
+                cap_top = p.segment(x0=[x_left], y0=[y_val + err], 
+                                x1=[x_right], y1=[y_val + err],
+                                line_width=2, color=color, alpha=0.8)
+                # Bottom cap  
+                cap_bottom = p.segment(x0=[x_left], y0=[y_val - err], 
+                                    x1=[x_right], y1=[y_val - err],
+                                    line_width=2, color=color, alpha=0.8)
+                
+                cell_renderers.extend([cap_top, cap_bottom])
+                
+                # Data points
+                scatter = p.scatter([x_cat], [y_val], size=8, color=color, alpha=0.8)
+                cell_renderers.append(scatter)
+            
+            # Add significance marker
+            if p_value < 0.001:
+                sig_text = "***"
+            elif p_value < 0.01:
+                sig_text = "**"
+            elif p_value < 0.05:
+                sig_text = "*"
+            else:
+                sig_text = ""
+            
+            if sig_text:
+                # Position significance marker above the post value
+                max_y = post_mean + post_sem + 0.01
+                sig_marker = p.text(['Post'], [max_y], text=[sig_text], 
+                    text_align="center", text_baseline="bottom", 
+                    text_color=color, text_font_size="14pt")
+                cell_renderers.append(sig_marker)
+            
+            # Add all renderers for this cell type to legend
+            legend_items.append((cell_type, cell_renderers))
+        
+        # Add zero reference line
+        p.line([-0.5, 1.5], [0, 0], line_color='black', line_dash='dashed', alpha=0.5)
+        
+        # Create legend
+        legend = Legend(items=legend_items, location="center", orientation="vertical", click_policy="hide")
+        p.add_layout(legend, 'right')
+        
+        # Style settings
+        p.xgrid.grid_line_color = None
+        p.ygrid.grid_line_color = None
+        
+        # Output plot
+        cell_type_str = "_".join(cell_data.keys())
+        output_title = f"{title} ({cell_type_str})"
+        self.output_bokeh_plot(p, save_path=save_path, title=output_title, notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return p, results
+
+    def _plot_fluorescence_dynamics(self, cell_data, cell_colors, time_axis, baseline_window, bin_size, title, save_path, notebook, overwrite, font_size):
+        """
+        Plot fluorescence time dynamics (similar to Figure 2g)
+        Shows time course with error bars and significance markers
+        """
+        from bokeh.plotting import figure
+        from bokeh.models import Legend, Span
+        from scipy import stats
+        import numpy as np
+        
+        # Define baseline window indices
+        baseline_start_idx = np.argmin(np.abs(time_axis - baseline_window[0]))
+        baseline_end_idx = np.argmin(np.abs(time_axis - baseline_window[1]))
+        
+        # Create time bins
+        bin_samples = int(bin_size * self.ci_rate)
+        n_bins = len(time_axis) // bin_samples
+        
+        # Create plot
+        p = figure(width=800, height=400, title=title,
+                x_axis_label='Time from velocity peak (s)', y_axis_label='Mean population ΔF/F\n(vs 2 s before velocity peak)')
+        
+        legend_items = []
+        
+        for cell_type, data in cell_data.items():
+            mean_trace = data['mean']
+            individual_data = data['individual']
+            
+            # Calculate baseline mean for each neuron
+            baseline_means = np.mean(individual_data[:, baseline_start_idx:baseline_end_idx], axis=1)
+            
+            # Time binning with baseline correction and statistics
+            binned_time = []
+            binned_signal = []
+            binned_sem = []
+            p_values = []
+            
+            for i in range(n_bins):
+                start_idx = i * bin_samples
+                end_idx = min((i + 1) * bin_samples, len(time_axis))
+                
+                if end_idx > start_idx:
+                    bin_time = np.mean(time_axis[start_idx:end_idx])
+                    
+                    # Calculate baseline-corrected values for each neuron
+                    bin_individual = np.mean(individual_data[:, start_idx:end_idx], axis=1)
+                    bin_corrected = bin_individual - baseline_means
+                    
+                    bin_signal = np.mean(bin_corrected)
+                    bin_sem = stats.sem(bin_corrected)
+                    
+                    # Statistical test: one-sample t-test against baseline (zero)
+                    if len(bin_corrected) > 1:
+                        t_stat, p_val = stats.ttest_1samp(bin_corrected, 0)
+                    else:
+                        p_val = 1.0
+                    
+                    binned_time.append(bin_time)
+                    binned_signal.append(bin_signal)
+                    binned_sem.append(bin_sem)
+                    p_values.append(p_val)
+            
+            binned_time = np.array(binned_time)
+            binned_signal = np.array(binned_signal)
+            binned_sem = np.array(binned_sem)
+            p_values = np.array(p_values)
+            
+            # Plot mean line
+            color = cell_colors[cell_type]
+            line = p.line(binned_time, binned_signal, line_width=3, color=color, alpha=0.8)
+            
+            # Add error bars
+            for i, (t, y, err) in enumerate(zip(binned_time, binned_signal, binned_sem)):
+                # Vertical error bar
+                p.line([t, t], [y - err, y + err], line_width=2, color=color, alpha=0.6)
+                # Error bar caps
+                cap_width = 0.05
+                p.line([t - cap_width, t + cap_width], [y - err, y - err], line_width=2, color=color, alpha=0.6)
+                p.line([t - cap_width, t + cap_width], [y + err, y + err], line_width=2, color=color, alpha=0.6)
+            
+            # Add data points
+            p.scatter(binned_time, binned_signal, size=6, color=color, alpha=0.8)
+            
+            # Add significance markers
+            for i, (t, y, err, p_val) in enumerate(zip(binned_time, binned_signal, binned_sem, p_values)):
+                if p_val < 0.001:
+                    sig_text = "***"
+                elif p_val < 0.01:
+                    sig_text = "**"
+                elif p_val < 0.05:
+                    sig_text = "*"
+                else:
+                    sig_text = ""
+                
+                if sig_text:
+                    # Position significance marker above error bar
+                    y_pos = y + err + 0.005
+                    p.text([t], [y_pos], text=[sig_text], 
+                        text_align="center", text_baseline="bottom", 
+                        text_color=color, text_font_size="12pt", text_font_style="bold")
+            
+            legend_items.append((cell_type, [line]))
+        
+        # Add event marker line (velocity peak at t=0)
+        event_line = Span(location=0, dimension='height', line_color='black', 
+                        line_dash='dashed', line_width=2, line_alpha=0.7)
+        p.add_layout(event_line)
+        
+        # Add baseline marker line (y=0)
+        baseline_line = Span(location=0, dimension='width', line_color='gray', 
+                            line_dash='dotted', line_width=1, line_alpha=0.5)
+        p.add_layout(baseline_line)
+        
+        # Create legend
+        legend = Legend(items=legend_items, location="center", orientation="horizontal", click_policy="hide")
+        p.add_layout(legend, 'above')
+        
+        # Style settings
+        p.xgrid.grid_line_color = None
+        p.ygrid.grid_line_color = None
+        
+        # Output plot
+        cell_type_str = "_".join(cell_data.keys())
+        output_title = f"{title} ({cell_type_str})"
         self.output_bokeh_plot(p, save_path=save_path, title=output_title, notebook=notebook, overwrite=overwrite, font_size=font_size)
         
         return p
@@ -3444,1226 +3873,6 @@ class CellTypeTank(CITank):
             font_size=font_size
         )
 
-    class NeuralConnectivityAnalyzer:
-        """
-        Nested class for analyzing functional connectivity between neural types.
-        Directly accesses parent CellTypeTank data without redundant property declarations.
-        """
-        
-        def __init__(self, parent_tank, save_dir=None, use_rising_edges=True):
-            """
-            Initialize analyzer with reference to parent CellTypeTank and optionally run full analysis
-            
-            Parameters:
-            -----------
-            parent_tank : CellTypeTank
-                Parent CellTypeTank object containing neural data
-            save_dir : str, optional
-                Directory to save results
-            use_rising_edges : bool
-                Whether to use rising edges instead of peak indices
-            run_analysis : bool
-                Whether to run the full analysis during initialization
-            """
-            self.tank = parent_tank
-
-            print(f"Neural Connectivity Analyzer initialized:")
-            print(f"D1 neurons: {len(self.tank.d1_peak_indices)} cells, total {sum(len(peaks) for peaks in self.tank.d1_peak_indices)} peaks")
-            print(f"D2 neurons: {len(self.tank.d2_peak_indices)} cells, total {sum(len(peaks) for peaks in self.tank.d2_peak_indices)} peaks")
-            print(f"CHI neurons: {len(self.tank.chi_peak_indices)} cells, total {sum(len(peaks) for peaks in self.tank.chi_peak_indices)} peaks")
-
-            
-            # Store analysis results - initialize all properties that will be set by analysis methods
-            self.binary_signals = self.create_binary_signals_from_peaks(window_size=5, use_rising_edges=use_rising_edges)
-            self.conditional_probs = self.calculate_conditional_probabilities(time_windows=[5, 10, 20, 50])
-            self.cross_correlations = self.calculate_cross_correlations_from_peaks(max_lag=100)
-            self.coactivation_patterns = self.identify_coactivation_patterns_from_peaks(min_duration=3)
-            self.peak_timing_relationships = self.calculate_peak_timing_relationships()
-            self.mutual_information = self.calculate_mutual_information_from_peaks(bins=10)
-            self.network = self.create_connectivity_network(threshold=0.1)
-            
-            self.generate_summary_report()
-            self.analysis_results = self.get_analysis_results()
-            
-            print("Full neural connectivity analysis completed!")
-        
-        def get_analysis_results(self):
-            """
-            Get all analysis results as a dictionary
-            
-            Returns:
-            --------
-            dict : Analysis results
-            """
-            return {
-                'binary_signals': self.binary_signals,
-                'conditional_probs': self.conditional_probs,
-                'cross_correlations': self.cross_correlations,
-                'coactivation_patterns': self.coactivation_patterns,
-                'peak_timing_relationships': self.peak_timing_relationships,
-                'mutual_information': self.mutual_information,
-                'network': self.network
-            }
-        
-        def create_binary_signals_from_peaks(self, window_size=5, use_rising_edges=True):
-            """
-            Create binary activation signals based on existing peak indices
-            
-            Parameters:
-            -----------
-            window_size : int
-                Duration window size for activation events (in samples)
-            use_rising_edges : bool
-                Whether to use rising edges instead of peak indices
-            
-            Returns:
-            --------
-            dict : Contains binary signals for each neural type
-            """
-            print("Creating binary activation signals from existing peak indices...")
-            
-            # Choose between peak indices or rising edges
-            if use_rising_edges:
-                d1_events = self.tank.d1_rising_edges_starts
-                d2_events = self.tank.d2_rising_edges_starts
-                chi_events = self.tank.chi_rising_edges_starts
-                print("Using rising edges data")
-            else:
-                d1_events = self.tank.d1_peak_indices
-                d2_events = self.tank.d2_peak_indices
-                chi_events = self.tank.chi_peak_indices
-                print("Using peak indices data")
-            
-            signal_length = len(self.tank.d1_denoised[0])
-            
-            # Create D1 binary signals
-            d1_binary = np.zeros((len(d1_events), signal_length))
-            for i, events in enumerate(d1_events):
-                for event in events:
-                    start = max(0, event - window_size//2)
-                    end = min(signal_length, event + window_size//2 + 1)
-                    d1_binary[i, start:end] = 1
-            
-            # Create D2 binary signals
-            d2_binary = np.zeros((len(d2_events), signal_length))
-            for i, events in enumerate(d2_events):
-                for event in events:
-                    start = max(0, event - window_size//2)
-                    end = min(signal_length, event + window_size//2 + 1)
-                    d2_binary[i, start:end] = 1
-            
-            # Create CHI binary signals
-            chi_binary = np.zeros((len(chi_events), signal_length))
-            for i, events in enumerate(chi_events):
-                for event in events:
-                    start = max(0, event - window_size//2)
-                    end = min(signal_length, event + window_size//2 + 1)
-                    chi_binary[i, start:end] = 1
-            
-            binary_signals = {
-                'D1': d1_binary,
-                'D2': d2_binary,
-                'CHI': chi_binary
-            }
-            
-            return binary_signals
-        
-        def calculate_conditional_probabilities(self, time_windows=[5, 10, 20, 50]):
-            """
-            Calculate conditional activation probabilities
-            
-            Parameters:
-            -----------
-            time_windows : list
-                Different time window sizes (in samples)
-            
-            Returns:
-            --------
-            dict : Conditional probability results
-            """
-            print("Calculating conditional activation probabilities...")
-            
-            results = {}
-            
-            for window in time_windows:
-                window_results = {}
-                
-                # Calculate population activation signals (how many neurons are active at each time point)
-                d1_population = np.sum(self.binary_signals['D1'], axis=0)
-                d2_population = np.sum(self.binary_signals['D2'], axis=0)
-                chi_population = np.sum(self.binary_signals['CHI'], axis=0)
-                
-                # Binarize population signals (at least one neuron active)
-                d1_active = (d1_population > 0).astype(int)
-                d2_active = (d2_population > 0).astype(int)
-                chi_active = (chi_population > 0).astype(int)
-                
-                # Calculate conditional probability P(B activated | A activated)
-                def calc_conditional_prob(signal_a, signal_b, window_size):
-                    """Calculate probability of B activation within window_size time after A activation"""
-                    a_events = np.where(signal_a == 1)[0]
-                    if len(a_events) == 0:
-                        return 0.0
-                    
-                    conditional_activations = 0
-                    for event in a_events:
-                        # Check time window after the event
-                        start = event + 1
-                        end = min(len(signal_b), event + window_size + 1)
-                        if start < len(signal_b) and np.any(signal_b[start:end]):
-                            conditional_activations += 1
-                    
-                    return conditional_activations / len(a_events)
-                
-                # Calculate conditional probabilities for all pairs
-                pairs = [('D1', 'D2'), ('D1', 'CHI'), ('D2', 'D1'), 
-                        ('D2', 'CHI'), ('CHI', 'D1'), ('CHI', 'D2')]
-                
-                signals = {'D1': d1_active, 'D2': d2_active, 'CHI': chi_active}
-                
-                for source, target in pairs:
-                    prob = calc_conditional_prob(signals[source], signals[target], window)
-                    window_results[f'{source}_to_{target}'] = prob
-                
-                results[f'window_{window}'] = window_results
-            
-            
-            return results
-        
-        def calculate_cross_correlations_from_peaks(self, max_lag=100):
-            """
-            Calculate time-lagged cross-correlations based on existing peak indices
-            
-            Parameters:
-            -----------
-            max_lag : int
-                Maximum lag time (in samples)
-            
-            Returns:
-            --------
-            dict : Cross-correlation results
-            """
-            print("Calculating time-lagged cross-correlations from peak indices...")
-            
-            # Calculate population activation signals
-            d1_population = np.sum(self.binary_signals['D1'], axis=0)
-            d2_population = np.sum(self.binary_signals['D2'], axis=0)
-            chi_population = np.sum(self.binary_signals['CHI'], axis=0)
-            
-            signals = {
-                'D1': d1_population,
-                'D2': d2_population,
-                'CHI': chi_population
-            }
-            
-            results = {}
-            lags = np.arange(-max_lag, max_lag + 1)
-            
-            # Calculate cross-correlations for all pairs
-            pairs = [('D1', 'D2'), ('D1', 'CHI'), ('D2', 'CHI')]
-            
-            for source, target in pairs:
-                correlation = np.correlate(signals[source], signals[target], mode='full')
-                
-                # Normalize
-                n = len(signals[source])
-                std_source = np.std(signals[source])
-                std_target = np.std(signals[target])
-                
-                if std_source > 0 and std_target > 0:
-                    correlation = correlation / (std_source * std_target * n)
-                else:
-                    correlation = np.zeros_like(correlation)
-                
-                # Extract lag range of interest
-                center = len(correlation) // 2
-                start = center - max_lag
-                end = center + max_lag + 1
-                correlation = correlation[start:end]
-                
-                results[f'{source}_vs_{target}'] = {
-                    'lags': lags,
-                    'correlation': correlation,
-                    'peak_lag': lags[np.argmax(np.abs(correlation))],
-                    'peak_correlation': np.max(np.abs(correlation))
-                }
-            
-            return results
-        
-        def identify_coactivation_patterns_from_peaks(self, min_duration=3):
-            """
-            Identify co-activation patterns based on existing peak indices
-            
-            Parameters:
-            -----------
-            min_duration : int
-                Minimum co-activation duration (in samples)
-            
-            Returns:
-            --------
-            dict : Co-activation pattern statistics
-            """
-            print("Identifying co-activation patterns from peak indices...")
-            
-            # Calculate population activation signals
-            d1_active = (np.sum(self.binary_signals['D1'], axis=0) > 0).astype(int)
-            d2_active = (np.sum(self.binary_signals['D2'], axis=0) > 0).astype(int)
-            chi_active = (np.sum(self.binary_signals['CHI'], axis=0) > 0).astype(int)
-            
-            # Create combination activation patterns
-            patterns = {
-                'D1_only': d1_active * (1 - d2_active) * (1 - chi_active),
-                'D2_only': (1 - d1_active) * d2_active * (1 - chi_active),
-                'CHI_only': (1 - d1_active) * (1 - d2_active) * chi_active,
-                'D1_D2': d1_active * d2_active * (1 - chi_active),
-                'D1_CHI': d1_active * (1 - d2_active) * chi_active,
-                'D2_CHI': (1 - d1_active) * d2_active * chi_active,
-                'D1_D2_CHI': d1_active * d2_active * chi_active,
-                'None': (1 - d1_active) * (1 - d2_active) * (1 - chi_active)
-            }
-            
-            # Calculate duration and frequency statistics for each pattern
-            results = {}
-            
-            for pattern_name, pattern_signal in patterns.items():
-                # Find continuous activation segments
-                diff = np.diff(np.concatenate(([0], pattern_signal, [0])))
-                starts = np.where(diff == 1)[0]
-                ends = np.where(diff == -1)[0]
-                
-                durations = ends - starts
-                valid_episodes = durations >= min_duration
-                
-                results[pattern_name] = {
-                    'total_episodes': len(durations),
-                    'valid_episodes': np.sum(valid_episodes),
-                    'total_duration': np.sum(durations),
-                    'valid_duration': np.sum(durations[valid_episodes]),
-                    'mean_duration': np.mean(durations) if len(durations) > 0 else 0,
-                    'proportion': np.sum(pattern_signal) / len(pattern_signal)
-                }
-            
-            return results
-        
-        def calculate_peak_timing_relationships(self):
-            """
-            Analyze peak timing relationships between different neural types
-            
-            Returns:
-            --------
-            dict : Peak timing relationship analysis results
-            """
-            print("Analyzing peak timing relationships...")
-            
-            # Convert all peaks to time series
-            def peaks_to_times(peak_indices_list):
-                """Convert peak indices to time points (seconds)"""
-                all_times = []
-                for peaks in peak_indices_list:
-                    times = peaks / self.tank.ci_rate
-                    all_times.extend(times)
-                return np.array(sorted(all_times))
-            
-            d1_times = peaks_to_times(self.tank.d1_peak_indices)
-            d2_times = peaks_to_times(self.tank.d2_peak_indices)
-            chi_times = peaks_to_times(self.tank.chi_peak_indices)
-            
-            results = {}
-            
-            # Calculate inter-peak interval distributions
-            def calc_inter_peak_intervals(times):
-                if len(times) > 1:
-                    return np.diff(times)
-                return np.array([])
-            
-            results['inter_peak_intervals'] = {
-                'D1': calc_inter_peak_intervals(d1_times),
-                'D2': calc_inter_peak_intervals(d2_times),
-                'CHI': calc_inter_peak_intervals(chi_times)
-            }
-            
-            # Calculate temporal proximity between different types
-            def calc_peak_proximity(times1, times2, max_distance=2.0):
-                """Calculate temporal proximity between two peak time groups (within seconds)"""
-                proximities = []
-                for t1 in times1:
-                    distances = np.abs(times2 - t1)
-                    min_distance = np.min(distances) if len(distances) > 0 else np.inf
-                    if min_distance <= max_distance:
-                        proximities.append(min_distance)
-                return np.array(proximities)
-            
-            results['peak_proximities'] = {
-                'D1_to_D2': calc_peak_proximity(d1_times, d2_times),
-                'D1_to_CHI': calc_peak_proximity(d1_times, chi_times),
-                'D2_to_D1': calc_peak_proximity(d2_times, d1_times),
-                'D2_to_CHI': calc_peak_proximity(d2_times, chi_times),
-                'CHI_to_D1': calc_peak_proximity(chi_times, d1_times),
-                'CHI_to_D2': calc_peak_proximity(chi_times, d2_times)
-            }
-            
-            # Calculate sequential activation patterns (activation order within time window) - optimized version
-            def find_sequential_activations(times1, times2, times3, window=1.0, max_sequence_length=5):
-                """Find sequential activation patterns within time window, limiting sequence length"""
-                sequences = []
-                
-                # Combine all time points and mark types
-                all_events = []
-                for t in times1:
-                    all_events.append((t, 'D1'))
-                for t in times2:
-                    all_events.append((t, 'D2'))
-                for t in times3:
-                    all_events.append((t, 'CHI'))
-                
-                # Sort by time
-                all_events.sort(key=lambda x: x[0])
-                
-                # Find sequences within window, limiting sequence length
-                for i, (start_time, start_type) in enumerate(all_events):
-                    window_events = [(start_time, start_type)]
-                    
-                    for j in range(i+1, len(all_events)):
-                        event_time, event_type = all_events[j]
-                        if event_time - start_time <= window:
-                            window_events.append((event_time, event_type))
-                            # Limit sequence length
-                            if len(window_events) >= max_sequence_length:
-                                break
-                        else:
-                            break
-                    
-                    if len(window_events) >= 2:
-                        sequence = tuple([event[1] for event in window_events])
-                        sequences.append(sequence)
-                
-                return sequences
-            
-            sequences = find_sequential_activations(d1_times, d2_times, chi_times, 
-                                                  window=1.0, max_sequence_length=5)
-            
-            # Count sequence patterns
-            from collections import Counter
-            sequence_counts = Counter(sequences)
-            results['sequential_patterns'] = dict(sequence_counts)
-            
-            return results
-        
-        def calculate_mutual_information_from_peaks(self, bins=10):
-            """
-            Calculate mutual information between neural types based on existing peak indices
-            
-            Parameters:
-            -----------
-            bins : int
-                Number of bins for discretization
-            
-            Returns:
-            --------
-            dict : Mutual information matrix
-            """
-            print("Calculating mutual information from peak data...")
-            
-            # Calculate population activation strength
-            d1_strength = np.sum(self.binary_signals['D1'], axis=0)
-            d2_strength = np.sum(self.binary_signals['D2'], axis=0)
-            chi_strength = np.sum(self.binary_signals['CHI'], axis=0)
-            
-            # Discretize signals
-            def discretize(signal, bins):
-                if np.max(signal) > 0:
-                    return np.digitize(signal, np.linspace(0, np.max(signal), bins))
-                else:
-                    return np.zeros_like(signal, dtype=int)
-            
-            d1_discrete = discretize(d1_strength, bins)
-            d2_discrete = discretize(d2_strength, bins)
-            chi_discrete = discretize(chi_strength, bins)
-            
-            signals = {
-                'D1': d1_discrete,
-                'D2': d2_discrete,
-                'CHI': chi_discrete
-            }
-            
-            # Calculate mutual information for all pairs
-            from sklearn.metrics import mutual_info_score
-            results = {}
-            pairs = [('D1', 'D2'), ('D1', 'CHI'), ('D2', 'CHI')]
-            
-            for source, target in pairs:
-                mi = mutual_info_score(signals[source], signals[target])
-                results[f'{source}_vs_{target}'] = mi
-            
-            self.mutual_information = results
-            return results
-        
-        def create_connectivity_network(self, threshold=0.1):
-            """
-            Create functional connectivity network
-            
-            Parameters:
-            -----------
-            threshold : float
-                Connection strength threshold
-            
-            Returns:
-            --------
-            networkx.Graph : Network graph object
-            """
-            print("Creating functional connectivity network...")
-            
-            import networkx as nx
-            G = nx.DiGraph()
-            
-            # Add nodes
-            G.add_node('D1', type='D1', color='navy')
-            G.add_node('D2', type='D2', color='crimson')
-            G.add_node('CHI', type='CHI', color='green')
-            
-            # Add directed edges based on conditional probabilities
-            # Use shortest time window results
-            window_key = list(self.conditional_probs.keys())[0]
-            probs = self.conditional_probs[window_key]
-            
-            for connection, prob in probs.items():
-                if prob > threshold:
-                    source, target = connection.split('_to_')
-                    G.add_edge(source, target, weight=prob, type='conditional_prob')
-            
-            # Add undirected edge weights based on mutual information
-            for connection, mi in self.mutual_information.items():
-                source, target = connection.split('_vs_')
-                if G.has_edge(source, target):
-                    G[source][target]['mutual_info'] = mi
-                elif G.has_edge(target, source):
-                    G[target][source]['mutual_info'] = mi
-            
-            return G
-        
-        def generate_summary_report(self):
-            """
-            Generate analysis summary report
-            """
-            print("\n" + "="*60)
-            print("Neural Functional Connectivity Analysis Report")
-            print("="*60)
-            
-            # Basic statistics
-            print("\n1. Peak Event Statistics:")
-            d1_total = sum(len(peaks) for peaks in self.tank.d1_peak_indices)
-            d2_total = sum(len(peaks) for peaks in self.tank.d2_peak_indices)
-            chi_total = sum(len(peaks) for peaks in self.tank.chi_peak_indices)
-            
-            print(f"   D1: {len(self.tank.d1_peak_indices)} neurons, total {d1_total} peaks, average {d1_total/len(self.tank.d1_peak_indices):.1f} peaks/neuron")
-            print(f"   D2: {len(self.tank.d2_peak_indices)} neurons, total {d2_total} peaks, average {d2_total/len(self.tank.d2_peak_indices):.1f} peaks/neuron")
-            print(f"   CHI: {len(self.tank.chi_peak_indices)} neurons, total {chi_total} peaks, average {chi_total/len(self.tank.chi_peak_indices):.1f} peaks/neuron")
-            
-            # Conditional probabilities
-            print("\n2. Conditional Activation Probabilities (shortest time window):")
-            window_key = list(self.conditional_probs.keys())[0]
-            probs = self.conditional_probs[window_key]
-            for connection, prob in probs.items():
-                source, target = connection.split('_to_')
-                print(f"   P({target} activated|{source} activated) = {prob:.3f}")
-            
-            # Cross-correlation peaks
-            print("\n3. Cross-correlation Peaks:")
-            for pair, data in self.cross_correlations.items():
-                print(f"   {pair}: peak correlation={data['peak_correlation']:.3f}, "
-                      f"lag={data['peak_lag']} samples")
-            
-            # Co-activation patterns
-            print("\n4. Major Co-activation Patterns:")
-            patterns = self.coactivation_patterns
-            sorted_patterns = sorted(patterns.items(), 
-                                   key=lambda x: x[1]['proportion'], reverse=True)
-            for pattern, stats in sorted_patterns[:5]:
-                print(f"   {pattern}: {stats['proportion']:.3f} "
-                      f"({stats['valid_episodes']} valid episodes)")
-            
-            # Peak timing relationships
-            print("\n5. Peak Timing Relationships:")
-            proximities = self.peak_timing_relationships['peak_proximities']
-            for pair, prox_array in proximities.items():
-                if len(prox_array) > 0:
-                    mean_prox = np.mean(prox_array)
-                    print(f"   {pair}: average proximity={mean_prox:.3f}s ({len(prox_array)} proximity events)")
-            
-            # Mutual information
-            print("\n6. Mutual Information:")
-            for pair, mi in self.mutual_information.items():
-                print(f"   {pair}: {mi:.3f}")
-            
-            print("\n" + "="*60)
-        
-        
-        def plot_peak_timing_relationships(self, save_path=None, title="Peak Timing Relationships Analysis", 
-                                         notebook=False, overwrite=False, font_size=None):
-            """
-            Plot peak timing relationship graphs
-            
-            Parameters:
-            -----------
-            save_path : str, optional
-                Path to save the plot as an HTML file
-            title : str, optional
-                Title for the plot
-            notebook : bool
-                Flag to indicate if the plot is for a Jupyter notebook
-            overwrite : bool
-                Flag to indicate whether to overwrite existing file
-            font_size : str, optional
-                Font size for all text elements in the plot
-            
-            Returns:
-            --------
-            bokeh.layouts.layout
-                The created plot layout
-            """
-            from bokeh.plotting import figure
-            from bokeh.layouts import column
-            from bokeh.models import Range1d
-            
-            results = self.peak_timing_relationships
-            
-            # 1. Inter-peak intervals distribution with FIXED AXES
-            p1 = figure(width=800, height=400, 
-                       title="Inter-Peak Interval Distribution",
-                       x_axis_label="Interval Time (seconds)",
-                       y_axis_label="Density")
-            
-            # Remove grid
-            p1.grid.grid_line_color = None
-            
-            colors = ['navy', 'crimson', 'green']
-            cell_types = ['D1', 'D2', 'CHI']
-            
-            has_interval_data = False
-            all_intervals = []
-            
-            for i, cell_type in enumerate(cell_types):
-                intervals = results['inter_peak_intervals'][cell_type]
-                if len(intervals) > 0:
-                    has_interval_data = True
-                    all_intervals.extend(intervals)
-                    
-                    # Use more bins for better visualization and density=True for proper scaling
-                    hist, edges = np.histogram(intervals, bins=50, density=True)
-                    centers = (edges[:-1] + edges[1:]) / 2
-                    
-                    p1.line(centers, hist, line_width=3, color=colors[i], 
-                           legend_label=f'{cell_type} (n={len(intervals)})')
-                    
-                    # Add circles to make lines more visible
-                    p1.scatter(centers, hist, size=4, color=colors[i], alpha=0.6)
-            
-            if has_interval_data and len(all_intervals) > 0:
-                # Set explicit axis ranges based on data (use 95th percentile to avoid outliers)
-                x_min, x_max = 0, np.percentile(all_intervals, 95)
-                p1.x_range = Range1d(x_min, x_max)
-            else:
-                p1.text([0.5], [0.5], ["No inter-peak interval data available"], 
-                       text_align="center", text_baseline="middle")
-            
-            p1.legend.click_policy = "hide"
-            
-            # 2. Peak proximity distribution with FIXED AXES
-            p2 = figure(width=800, height=400,
-                       title="Peak Proximity Between Different Types",
-                       x_axis_label="Minimum Distance (seconds)",
-                       y_axis_label="Frequency")
-            
-            # Remove grid
-            p2.grid.grid_line_color = None
-            
-            proximities = results['peak_proximities']
-            pair_colors = ['purple', 'orange', 'brown', 'pink', 'gray', 'cyan']
-            
-            has_proximity_data = False
-            all_proximities = []
-            max_frequency = 0
-            
-            for i, (pair, prox_array) in enumerate(proximities.items()):
-                if len(prox_array) > 0:
-                    has_proximity_data = True
-                    all_proximities.extend(prox_array)
-                    
-                    # Use fewer bins for better visibility
-                    hist, edges = np.histogram(prox_array, bins=25)
-                    max_frequency = max(max_frequency, hist.max())
-                    
-                    p2.quad(top=hist, bottom=0, left=edges[:-1], right=edges[1:],
-                           fill_color=pair_colors[i % len(pair_colors)], alpha=0.7,
-                           legend_label=f'{pair} (n={len(prox_array)})')
-            
-            if has_proximity_data and len(all_proximities) > 0:
-                # Set explicit axis ranges
-                x_min, x_max = 0, np.percentile(all_proximities, 95)
-                y_max = max_frequency * 1.1  # Add 10% padding
-                p2.x_range = Range1d(x_min, x_max)
-                p2.y_range = Range1d(0, y_max)
-            else:
-                p2.text([0.5], [0.5], ["No peak proximity data available"], 
-                       text_align="center", text_baseline="middle")
-            
-            p2.legend.click_policy = "hide"
-            
-            # 3. Sequential activation patterns with FIXED AXES
-            if 'sequential_patterns' in results:
-                patterns = results['sequential_patterns']
-                if patterns:
-                    # Convert tuples to strings and limit display to most common patterns
-                    pattern_items = list(patterns.items())
-                    # Sort by frequency, take top 15 most common patterns
-                    pattern_items.sort(key=lambda x: x[1], reverse=True)
-                    top_patterns = pattern_items[:15]  # Show more patterns
-                    
-                    # Convert tuples to strings
-                    pattern_names = [' → '.join(pattern) for pattern, _ in top_patterns]
-                    pattern_counts = [count for _, count in top_patterns]
-                    
-                    p3 = figure(width=1200, height=500,  # Made wider and taller
-                               title="Sequential Activation Pattern Frequency (Top 15 Most Common)",
-                               x_axis_label="Activation Sequence",
-                               y_axis_label="Occurrence Count")
-                    
-                    # Remove grid
-                    p3.grid.grid_line_color = None
-                    
-                    # Create bar chart with explicit positioning (FIX: don't use categorical strings directly)
-                    x_pos = list(range(len(pattern_names)))
-                    p3.vbar(x=x_pos, top=pattern_counts, width=0.8, 
-                           color='steelblue', alpha=0.7)
-                    
-                    # Set explicit axis ranges
-                    p3.x_range = Range1d(-0.5, len(pattern_names) - 0.5)
-                    p3.y_range = Range1d(0, max(pattern_counts) * 1.1)
-                    
-                    # Override x-axis labels (FIX: use explicit label overrides)
-                    p3.xaxis.ticker = x_pos
-                    p3.xaxis.major_label_overrides = {i: name for i, name in enumerate(pattern_names)}
-                    p3.xaxis.major_label_orientation = 45
-                else:
-                    p3 = figure(width=800, height=400, title="No Sequential Activation Patterns Found")
-                    p3.grid.grid_line_color = None
-                    p3.text([0.5], [0.5], ["No Sequential Activation Patterns Found"], 
-                           text_align="center", text_baseline="middle")
-            else:
-                p3 = figure(width=800, height=400, title="Sequential Activation Pattern Analysis Not Run")
-                p3.grid.grid_line_color = None
-                p3.text([0.5], [0.5], ["Sequential Activation Pattern Analysis Not Run"], 
-                       text_align="center", text_baseline="middle")
-            
-            layout = column(p1, p2, p3)
-            
-            # Set default save path if none provided
-            if save_path is None:
-                save_path = os.path.join(self.tank.config["SummaryPlotsPath"], 
-                                       self.tank.session_name, 
-                                       'Peak_Timing_Relationships.html')
-            
-            # Use tank's output_bokeh_plot method
-            self.tank.output_bokeh_plot(layout, save_path=save_path, title=title, 
-                                      notebook=notebook, overwrite=overwrite, font_size=font_size)
-            
-            return layout
-        
-        def plot_connectivity_analysis_summary(self, save_path=None, title="Neural Connectivity Analysis Summary",
-                                             notebook=False, overwrite=False, font_size=None):
-            """
-            Create comprehensive visualization of connectivity analysis results
-            
-            Parameters:
-            -----------
-            save_path : str, optional
-                Path to save the plot as an HTML file
-            title : str, optional
-                Title for the plot
-            notebook : bool
-                Flag to indicate if the plot is for a Jupyter notebook
-            overwrite : bool
-                Flag to indicate whether to overwrite existing file
-            font_size : str, optional
-                Font size for all text elements in the plot
-            
-            Returns:
-            --------
-            bokeh.layouts.layout
-                The created plot layout
-            """
-            def create_enhanced_connectivity_visualizations(analyzer):
-                """
-                Create enhanced connectivity visualizations to better display analysis results
-                """
-                from bokeh.plotting import figure
-                from bokeh.layouts import column, row, gridplot
-                from bokeh.models import ColumnDataSource, HoverTool, Legend, LegendItem, Arrow, VeeHead
-                from bokeh.palettes import RdYlBu11, Spectral6
-                import networkx as nx
-                import pandas as pd
-                import numpy as np
-                
-                plots = []
-                
-                # 1. Conditional Probability Heatmap Matrix
-                def create_conditional_probability_heatmap():
-                    if not hasattr(analyzer, 'conditional_probs'):
-                        return None
-                        
-                    # Use the shortest time window data
-                    window_key = list(analyzer.conditional_probs.keys())[0]
-                    probs = analyzer.conditional_probs[window_key]
-                    
-                    # Create 3x3 matrix - corrected coordinate system
-                    cell_types = ['CHI', 'D1', 'D2']
-                    matrix_data = []
-                    
-                    for i, source in enumerate(cell_types):
-                        for j, target in enumerate(cell_types):
-                            if source != target:
-                                key = f'{source}_to_{target}'
-                                prob = probs.get(key, 0)
-                            else:
-                                prob = 0  # Self-to-self set to 0
-                            
-                            # Format probability value to 3 decimal places
-                            prob_formatted = f'{prob:.3f}' if prob > 0 else '0'
-                            
-                            matrix_data.append({
-                                'source': source,
-                                'target': target,
-                                'probability': prob,
-                                'probability_text': prob_formatted,
-                                'x': j,      # Column index - Target
-                                'y': 2-i,    # Row index - Source (flipped: CHI=2, D1=1, D2=0)
-                                'color_value': prob
-                            })
-                    
-                    df = pd.DataFrame(matrix_data)
-                    
-                    # Create HoverTool
-                    hover = HoverTool(tooltips=[
-                        ('From', '@source'),
-                        ('To', '@target'),
-                        ('Probability', '@probability{0.000}')
-                    ])
-                    
-                    p = figure(width=450, height=450,
-                              title="Conditional Activation Probability Matrix P(Target|Source)",
-                              x_range=[-0.5, 2.5],           # Extended range to center squares
-                              y_range=[-0.5, 2.5],           # Extended range to center squares
-                              tools=[hover, 'pan', 'wheel_zoom', 'box_zoom', 'reset', 'save'])
-                    
-                    # Create color mapping
-                    from bokeh.transform import linear_cmap
-                    from bokeh.palettes import RdYlBu11
-                    
-                    source_data = ColumnDataSource(df)
-                    
-                    # Draw heatmap squares
-                    p.rect(x='x', y='y', width=0.9, height=0.9, source=source_data,
-                           fill_color=linear_cmap('color_value', RdYlBu11, 0, df['probability'].max()),
-                           line_color='white', line_width=3)
-                    
-                    # Add probability value text
-                    p.text(x='x', y='y', text='probability_text', source=source_data,
-                           text_align='center', text_baseline='middle', text_font_size='16pt',
-                           text_color='black', text_font_style='bold')
-                    
-                    # Set axis labels
-                    p.xaxis.ticker = [0, 1, 2]
-                    p.yaxis.ticker = [0, 1, 2]
-                    p.xaxis.major_label_overrides = {0: "CHI", 1: "D1", 2: "D2"}
-                    p.yaxis.major_label_overrides = {0: "D2", 1: "D1", 2: "CHI"}  # Flipped labels
-                    
-                    # Correct axis labels
-                    p.xaxis.axis_label = "Target (Activated Neuron Type)"
-                    p.yaxis.axis_label = "Source (Activating Neuron Type)"
-                    
-                    # Add axis label styling
-                    p.xaxis.axis_label_text_font_size = "12pt"
-                    p.yaxis.axis_label_text_font_size = "12pt"
-                    p.xaxis.major_label_text_font_size = "12pt"
-                    p.yaxis.major_label_text_font_size = "12pt"
-                    
-                    return p
-                
-                # 2. Network Connection Strength Diagram
-                def create_network_strength_diagram():
-                    if not hasattr(analyzer, 'conditional_probs'):
-                        return None
-                        
-                    window_key = list(analyzer.conditional_probs.keys())[0]
-                    probs = analyzer.conditional_probs[window_key]
-                    
-                    p = figure(width=600, height=600,
-                              title="Neural Network Connection Strength Diagram",
-                              tools=['pan', 'wheel_zoom', 'box_zoom', 'reset'])
-                    
-                    # Node positions - triangular layout highlighting hierarchical relationships
-                    positions = {
-                        'CHI': (0.5, 0.8),    # Top - regulator
-                        'D1': (0.2, 0.3),     # Bottom left - relay
-                        'D2': (0.8, 0.3)      # Bottom right - executor
-                    }
-                    
-                    # Draw nodes
-                    node_colors = {'CHI': 'green', 'D1': 'navy', 'D2': 'crimson'}
-                    node_sizes = {'CHI': 60, 'D1': 80, 'D2': 70}  # D1 largest, emphasizing relay role
-                    
-                    for node, (x, y) in positions.items():
-                        p.scatter([x], [y], size=node_sizes[node], color=node_colors[node], 
-                                alpha=0.8, line_width=3, line_color='white')
-                        p.text([x], [y], [node], text_align='center', text_baseline='middle',
-                              text_font_size='14pt', text_color='white', text_font_style='bold')
-                    
-                    # Draw connection lines - line width represents connection strength
-                    max_prob = max(probs.values()) if probs.values() else 1
-                    
-                    for connection, prob in probs.items():
-                        source, target = connection.split('_to_')
-                        if prob > 0.1:  # Only show stronger connections
-                            x1, y1 = positions[source]
-                            x2, y2 = positions[target]
-                            
-                            # Line width proportional to probability
-                            line_width = max(2, prob / max_prob * 15)
-                            
-                            # Color depth represents strength
-                            alpha = 0.3 + (prob / max_prob) * 0.7
-                            
-                            p.line([x1, x2], [y1, y2], line_width=line_width, 
-                                  color='gray', alpha=alpha)
-                            
-                            # Add probability labels
-                            mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
-                            p.text([mid_x], [mid_y], [f'{prob:.2f}'], 
-                                  text_align='center', text_baseline='middle',
-                                  text_font_size='10pt', text_color='black',
-                                  background_fill_color='white', background_fill_alpha=0.8)
-                    
-                    p.axis.visible = False
-                    p.grid.visible = False
-                    p.x_range.start, p.x_range.end = -0.1, 1.1
-                    p.y_range.start, p.y_range.end = 0, 1
-                    
-                    return p
-                
-                # 3. Activation Cascade Timeline Plot
-                def create_activation_cascade_plot():
-                    if not hasattr(analyzer, 'peak_timing_relationships'):
-                        return None
-                        
-                    proximities = analyzer.peak_timing_relationships['peak_proximities']
-                    
-                    p = figure(width=800, height=400,
-                              title="Neural Activation Temporal Relationships (Average Proximity)",
-                              x_axis_label="Average Time Delay (seconds)",
-                              y_axis_label="Connection Type",
-                              tools=['pan', 'wheel_zoom', 'box_zoom', 'reset'])
-                    
-                    # Prepare data
-                    connections = []
-                    delays = []
-                    colors = []
-                    
-                    color_map = {
-                        'CHI_to_D1': 'green',
-                        'CHI_to_D2': 'lightgreen', 
-                        'D1_to_D2': 'blue',
-                        'D2_to_D1': 'red',
-                        'D1_to_CHI': 'orange',
-                        'D2_to_CHI': 'pink'
-                    }
-                    
-                    for connection, prox_array in proximities.items():
-                        if len(prox_array) > 0:
-                            connections.append(connection)
-                            delays.append(np.mean(prox_array))
-                            colors.append(color_map.get(connection, 'gray'))
-                    
-                    if not connections:
-                        return None
-                        
-                    # Sort by delay
-                    sorted_data = sorted(zip(connections, delays, colors), key=lambda x: x[1])
-                    connections, delays, colors = zip(*sorted_data)
-                    
-                    y_positions = list(range(len(connections)))
-                    
-                    p.scatter(delays, y_positions, size=15, color=colors, alpha=0.8)
-                    
-                    # Add connecting lines showing activation sequence
-                    for i in range(len(delays)-1):
-                        p.line([delays[i], delays[i+1]], [y_positions[i], y_positions[i+1]],
-                              line_dash='dashed', color='gray', alpha=0.5)
-                    
-                    p.yaxis.ticker = y_positions
-                    p.yaxis.major_label_overrides = {i: conn for i, conn in enumerate(connections)}
-                    
-                    return p
-                
-                # 4. Co-activation Pattern Pie Chart
-                def create_coactivation_pie_chart():
-                    if not hasattr(analyzer, 'coactivation_patterns'):
-                        return None
-                        
-                    patterns = analyzer.coactivation_patterns
-                    
-                    # Prepare data
-                    pattern_names = []
-                    proportions = []
-                    colors = []
-                    
-                    color_scheme = {
-                        'None': 'lightgray',
-                        'D1_only': 'navy',
-                        'D2_only': 'crimson', 
-                        'CHI_only': 'green',
-                        'D1_D2': 'purple',
-                        'D1_CHI': 'teal',
-                        'D2_CHI': 'orange',
-                        'D1_D2_CHI': 'gold'
-                    }
-                    
-                    for pattern, stats in patterns.items():
-                        if stats['proportion'] > 0.01:  # Only show patterns >1%
-                            pattern_names.append(pattern)
-                            proportions.append(stats['proportion'])
-                            colors.append(color_scheme.get(pattern, 'gray'))
-                    
-                    if not pattern_names:
-                        return None
-                        
-                    # Calculate angles
-                    angles = [p * 2 * np.pi for p in proportions]
-                    
-                    p = figure(width=500, height=500,
-                              title="Co-activation Pattern Distribution",
-                              tools=['pan', 'wheel_zoom', 'box_zoom', 'reset'])
-                    
-                    # Draw pie chart
-                    start_angle = 0
-                    for i, (angle, color, name, prop) in enumerate(zip(angles, colors, pattern_names, proportions)):
-                        end_angle = start_angle + angle
-                        
-                        p.wedge(x=0, y=0, radius=0.8, start_angle=start_angle, end_angle=end_angle,
-                               color=color, alpha=0.8, legend_label=f'{name}: {prop:.1%}')
-                        
-                        # Add labels
-                        mid_angle = (start_angle + end_angle) / 2
-                        label_x = 0.6 * np.cos(mid_angle)
-                        label_y = 0.6 * np.sin(mid_angle)
-                        
-                        if prop > 0.05:  # Only add labels for large segments
-                            p.text([label_x], [label_y], [f'{prop:.1%}'], 
-                                  text_align='center', text_baseline='middle',
-                                  text_font_size='10pt', text_color='white', text_font_style='bold')
-                        
-                        start_angle = end_angle
-                    
-                    p.axis.visible = False
-                    p.grid.visible = False
-                    p.legend.location = "center_right"
-                    p.legend.click_policy = "hide"
-                    
-                    return p
-                
-                # 5. Information Flow Diagram
-                def create_information_flow_diagram():
-                    if not hasattr(analyzer, 'mutual_information') or not hasattr(analyzer, 'conditional_probs'):
-                        return None
-                        
-                    # Create HoverTool
-                    hover = HoverTool(tooltips=[
-                        ('Connection', '@connection'),
-                        ('Conditional Prob', '@cond_prob{0.000}'),
-                        ('Mutual Info', '@mutual_info{0.000}')
-                    ])
-                    
-                    p = figure(width=600, height=400,
-                              title="Information Flow Strength Analysis",
-                              x_axis_label="Conditional Probability P(Target|Source)",
-                              y_axis_label="Mutual Information",
-                              tools=[hover, 'pan', 'wheel_zoom', 'box_zoom', 'reset'])
-                    
-                    # Prepare data
-                    window_key = list(analyzer.conditional_probs.keys())[0]
-                    cond_probs = analyzer.conditional_probs[window_key]
-                    mutual_info = analyzer.mutual_information
-                    
-                    # Map conditional probabilities to mutual information
-                    flow_data = []
-                    
-                    for connection, cond_prob in cond_probs.items():
-                        source, target = connection.split('_to_')
-                        
-                        # Find corresponding mutual information
-                        mi_key1 = f'{source}_vs_{target}'
-                        mi_key2 = f'{target}_vs_{source}'
-                        
-                        mi_value = mutual_info.get(mi_key1, mutual_info.get(mi_key2, 0))
-                        
-                        flow_data.append({
-                            'connection': connection,
-                            'cond_prob': cond_prob,
-                            'mutual_info': mi_value,
-                            'source': source,
-                            'target': target
-                        })
-                    
-                    if not flow_data:
-                        return None
-                        
-                    df = pd.DataFrame(flow_data)
-                    
-                    # Different connection types use different colors
-                    colors = []
-                    for _, row in df.iterrows():
-                        if 'CHI' in row['source']:
-                            colors.append('green')
-                        elif 'D1' in row['source']:
-                            colors.append('navy')
-                        else:
-                            colors.append('crimson')
-                    
-                    df['colors'] = colors
-                    
-                    source_data = ColumnDataSource(df)
-                    
-                    p.scatter('cond_prob', 'mutual_info', size=12, color='colors', 
-                            alpha=0.7, source=source_data)
-                    
-                    # Add connection labels
-                    p.text('cond_prob', 'mutual_info', 'connection', source=source_data,
-                          text_font_size='8pt', x_offset=5, y_offset=5)
-                    
-                    return p
-                
-                # Create all plots
-                p1 = create_conditional_probability_heatmap()
-                p2 = create_network_strength_diagram()
-                p3 = create_activation_cascade_plot()
-                p4 = create_coactivation_pie_chart()
-                p5 = create_information_flow_diagram()
-                
-                # Filter out None plots
-                valid_plots = [p for p in [p1, p2, p3, p4, p5] if p is not None]
-                
-                if not valid_plots:
-                    print("No available data to create visualization plots")
-                    return None
-                
-                # Combine layout
-                if len(valid_plots) >= 5:
-                    layout = column(
-                        row(valid_plots[0], valid_plots[1]),
-                        valid_plots[2],
-                        row(valid_plots[3], valid_plots[4])
-                    )
-                elif len(valid_plots) >= 3:
-                    layout = column(
-                        row(valid_plots[0], valid_plots[1]),
-                        *valid_plots[2:]
-                    )
-                else:
-                    layout = column(*valid_plots)
-                
-                return layout
-            
-            # Create enhanced plots using the analyzer instance (self)
-            layout = create_enhanced_connectivity_visualizations(self)
-            
-            if layout is None:
-                # Fallback to simple message if no data available
-                from bokeh.plotting import figure
-                from bokeh.layouts import column
-                
-                p = figure(width=800, height=400, title="No Connectivity Data Available")
-                p.grid.grid_line_color = None
-                p.text([0.5], [0.5], ["No connectivity analysis data available"], 
-                       text_align="center", text_baseline="middle")
-                p.axis.visible = False
-                layout = column(p)
-            
-            # Set default save path if none provided
-            if save_path is None:
-                save_path = os.path.join(self.tank.config["SummaryPlotsPath"], 
-                                       self.tank.session_name, 
-                                       'Connectivity_Analysis_Summary.html')
-            
-            # Use tank's output_bokeh_plot method
-            self.tank.output_bokeh_plot(layout, save_path=save_path, title=title, 
-                                      notebook=notebook, overwrite=overwrite, font_size=font_size)
-            
-            return layout
-        
-        def analyze_and_plot_connectivity(self, save_dir=None, use_rising_edges=True, 
-                                        create_plots=True, notebook=False, overwrite=False, font_size=None):
-            """
-            Complete connectivity analysis workflow with optional plotting
-            (Equivalent to the standalone analyze_neural_connectivity_optimized function)
-            
-            Parameters:
-            -----------
-            save_dir : str, optional
-                Directory to save results and plots
-            use_rising_edges : bool
-                Whether to use rising edges instead of peak indices
-            create_plots : bool
-                Whether to create and save plots
-            notebook : bool
-                Flag to indicate if plots are for Jupyter notebook
-            overwrite : bool
-                Flag to indicate whether to overwrite existing files
-            font_size : str, optional
-                Font size for plot text elements
-            
-            Returns:
-            --------
-            dict : Complete analysis results including plots if created
-            """
-            print("Running complete neural connectivity analysis workflow...")
-            
-            # Run the full analysis
-            results = self.analysis_results
-            
-            # Create plots if requested
-            if create_plots:
-                print("Creating connectivity analysis plots...")
-                
-                # Set save paths
-                if save_dir:
-                    timing_path = os.path.join(save_dir, 'peak_timing_relationships.html')
-                    summary_path = os.path.join(save_dir, 'connectivity_summary.html')
-                else:
-                    timing_path = None
-                    summary_path = None
-                
-                # Create timing relationships plot
-                timing_plot = self.plot_peak_timing_relationships(
-                    save_path=timing_path, 
-                    notebook=notebook, 
-                    overwrite=overwrite, 
-                    font_size=font_size
-                )
-                
-                # Create summary plot
-                summary_plot = self.plot_connectivity_analysis_summary(
-                    save_path=summary_path, 
-                    notebook=notebook, 
-                    overwrite=overwrite, 
-                    font_size=font_size
-                )
-                
-                results['timing_plot'] = timing_plot
-                results['summary_plot'] = summary_plot
-                
-                print("Connectivity analysis and plotting complete!")
-            
-            return results
-
     def create_connectivity_analyzer(self):
         """
         Create and return a NeuralConnectivityAnalyzer instance for this tank
@@ -4672,11 +3881,540 @@ class CellTypeTank(CITank):
         --------
         NeuralConnectivityAnalyzer : Analyzer instance
         """
-        return self.NeuralConnectivityAnalyzer(self)
-
+        return NeuralConnectivityAnalyzer(self)
+    
+    def plot_connectivity_timing_analysis(self, save_path=None, notebook=False, overwrite=False, font_size=None):
+        """
+        Generate timing relationships analysis plot
+        
+        Parameters:
+        -----------
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_timing_analysis.html')
+        
+        plot = connectivity.create_timing_plot(
+            save_path=save_path,
+            notebook=notebook,
+            overwrite=overwrite,
+            font_size=font_size
+        )
+        
+        return plot
+    
+    def plot_connectivity_summary_analysis(self, save_path=None, notebook=False, overwrite=False, font_size=None):
+        """
+        Generate connectivity analysis summary plot
+        
+        Parameters:
+        -----------
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_summary_analysis.html')
+        
+        plot = connectivity.create_summary_plot(
+            save_path=save_path,
+            notebook=notebook,
+            overwrite=overwrite,
+            font_size=font_size
+        )
+        
+        return plot
+    
+    def plot_connectivity_conditional_probabilities(self, time_windows=[5, 10, 20, 50], method='individual',
+                                                 save_path=None, notebook=False, overwrite=False, font_size=None):
+            """
+            Generate conditional probabilities analysis plot
+            
+            Parameters:
+            -----------
+            time_windows : list
+                Different time window sizes (in samples)
+            method : str
+                'individual' - calculate probabilities between individual neurons
+                'population' - calculate probabilities between cell type populations
+                'cell_type_proportion' - calculate using average proportion of target neurons activated per source activation
+            save_path : str, optional
+                Path to save the HTML file
+            notebook : bool
+                Whether to display in notebook
+            overwrite : bool
+                Whether to overwrite existing file
+            font_size : str, optional
+                Font size for plot text elements
+            
+            Returns:
+            --------
+            bokeh.layouts.layout : The created plot layout
+            """
+            connectivity = self.create_connectivity_analyzer()
+            
+            # Run conditional probabilities analysis
+            cond_prob_results = connectivity.run_conditional_probabilities_analysis(
+                time_windows=time_windows, 
+                method=method
+            )
+            
+            # Set default save path if none provided
+            if save_path is None:
+                save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                       self.session_name, 
+                                       'connectivity_conditional_probabilities.html')
+            
+            # Create a comprehensive visualization showing all time windows
+            from bokeh.plotting import figure
+            from bokeh.layouts import column, row, gridplot
+            import numpy as np
+            
+            # Create subplots for each time window
+            plots = []
+            
+            for window_key in cond_prob_results.keys():
+                probs = cond_prob_results[window_key]
+                
+                # Extract cell type probabilities
+                cell_type_probs = {}
+                for connection, prob in probs.items():
+                    if (connection.endswith('_to_D1') or connection.endswith('_to_D2') or 
+                        connection.endswith('_to_CHI')) and isinstance(prob, (int, float, np.integer, np.floating)):
+                        cell_type_probs[connection] = prob
+                
+                if cell_type_probs:
+                    connections = list(cell_type_probs.keys())
+                    probabilities = list(cell_type_probs.values())
+                    
+                    # Convert window size to time (assuming 20Hz sampling rate)
+                    time_seconds = int(window_key.split('_')[1]) / 20.0
+                    
+                    p = figure(width=400, height=300,
+                              title=f"Window: {window_key} ({time_seconds:.1f}s)",
+                              x_axis_label="Connection Type",
+                              y_axis_label="Probability",
+                              tools="pan,box_zoom,wheel_zoom,reset,save")
+                    
+                    # Color code by source cell type
+                    colors = []
+                    for conn in connections:
+                        if 'CHI_to_' in conn:
+                            colors.append('green')
+                        elif 'D1_to_' in conn:
+                            colors.append('navy')
+                        else:
+                            colors.append('crimson')
+                    
+                    p.vbar(x=connections, top=probabilities, width=0.5, color=colors, alpha=0.7)
+                    p.xaxis.major_label_orientation = 45
+                    
+                    plots.append(p)
+                else:
+                    # Create empty plot if no data
+                    p = figure(width=400, height=300, title=f"Window: {window_key} (No Data)")
+                    p.grid.grid_line_color = None
+                    p.text([0.5], [0.5], ["No data available"], 
+                           text_align="center", text_baseline="middle")
+                    p.axis.visible = False
+                    plots.append(p)
+            
+            # Arrange plots in a grid
+            if len(plots) == 1:
+                layout = column(plots[0])
+            elif len(plots) == 2:
+                layout = row(plots[0], plots[1])
+            elif len(plots) == 3:
+                layout = row(plots[0], plots[1], plots[2])
+            elif len(plots) == 4:
+                layout = gridplot([[plots[0], plots[1]], [plots[2], plots[3]]])
+            else:
+                layout = column(*plots)
+            
+            # Save the plot
+            self.output_bokeh_plot(layout, save_path=save_path, 
+                                  title="Conditional Probabilities Analysis - All Time Windows",
+                                  notebook=notebook, overwrite=overwrite, font_size=font_size)
+            
+            return layout
+    
+    def plot_connectivity_cross_correlations(self, max_lag=100, save_path=None, notebook=False, 
+                                           overwrite=False, font_size=None):
+        """
+        Generate cross-correlations analysis plot
+        
+        Parameters:
+        -----------
+        max_lag : int
+            Maximum lag for cross-correlation analysis
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Run cross-correlations analysis
+        cross_corr_results = connectivity.run_cross_correlations_analysis(max_lag=max_lag)
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_cross_correlations.html')
+        
+        # Create visualization of cross-correlations
+        from bokeh.plotting import figure
+        from bokeh.layouts import column
+        import numpy as np
+        
+        if not cross_corr_results:
+            # Create empty plot if no data
+            p = figure(width=600, height=400, title="No Cross-Correlation Data Available")
+            p.grid.grid_line_color = None
+            p.text([0.5], [0.5], ["No cross-correlation data available"], 
+                   text_align="center", text_baseline="middle")
+            p.axis.visible = False
+            layout = column(p)
+        else:
+            # Create bar plot of peak correlations
+            pairs = list(cross_corr_results.keys())
+            peak_correlations = [cross_corr_results[pair]['peak_correlation'] for pair in pairs]
+            peak_lags = [cross_corr_results[pair]['peak_lag'] for pair in pairs]
+            
+            p = figure(width=800, height=400,
+                      title=f"Cross-Correlation Peak Analysis (Max Lag: {max_lag})",
+                      x_axis_label="Neuron Pair",
+                      y_axis_label="Peak Correlation",
+                      tools="pan,box_zoom,wheel_zoom,reset,save")
+            
+            # Color code by correlation strength
+            colors = ['red' if corr < 0 else 'blue' for corr in peak_correlations]
+            
+            p.vbar(x=pairs, top=peak_correlations, width=0.5, color=colors, alpha=0.7)
+            p.xaxis.major_label_orientation = 45
+            
+            # Add lag information as text
+            p.text(x=pairs, y=peak_correlations, text=[f"lag={lag}" for lag in peak_lags],
+                  text_align="center", text_baseline="bottom", text_font_size="8pt")
+            
+            layout = column(p)
+        
+        # Save the plot
+        self.output_bokeh_plot(layout, save_path=save_path, 
+                              title="Cross-Correlations Analysis",
+                              notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return layout
+    
+    def plot_connectivity_coactivation_patterns(self, min_duration=3, save_path=None, notebook=False,
+                                              overwrite=False, font_size=None):
+        """
+        Generate coactivation patterns analysis plot
+        
+        Parameters:
+        -----------
+        min_duration : int
+            Minimum duration for coactivation patterns
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Run coactivation patterns analysis
+        coactivation_results = connectivity.run_coactivation_patterns_analysis(min_duration=min_duration)
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_coactivation_patterns.html')
+        
+        # Create visualization of coactivation patterns
+        from bokeh.plotting import figure
+        from bokeh.layouts import column
+        import numpy as np
+        
+        if not coactivation_results:
+            # Create empty plot if no data
+            p = figure(width=600, height=400, title="No Coactivation Pattern Data Available")
+            p.grid.grid_line_color = None
+            p.text([0.5], [0.5], ["No coactivation pattern data available"], 
+                   text_align="center", text_baseline="middle")
+            p.axis.visible = False
+            layout = column(p)
+        else:
+            # Create pie chart of coactivation patterns
+            patterns = list(coactivation_results.keys())
+            proportions = [coactivation_results[pattern]['proportion'] for pattern in patterns]
+            
+            # Filter patterns with proportion > 1%
+            significant_patterns = [(p, prop) for p, prop in zip(patterns, proportions) if prop > 0.01]
+            
+            if not significant_patterns:
+                p = figure(width=600, height=400, title="No Significant Coactivation Patterns")
+                p.grid.grid_line_color = None
+                p.text([0.5], [0.5], ["No significant coactivation patterns found"], 
+                       text_align="center", text_baseline="middle")
+                p.axis.visible = False
+                layout = column(p)
+            else:
+                pattern_names, pattern_props = zip(*significant_patterns)
+                
+                p = figure(width=800, height=400,
+                          title=f"Coactivation Patterns (Min Duration: {min_duration})",
+                          x_axis_label="Pattern Type",
+                          y_axis_label="Proportion",
+                          tools="pan,box_zoom,wheel_zoom,reset,save")
+                
+                # Color code patterns
+                colors = ['green', 'blue', 'red', 'orange', 'purple', 'brown', 'pink', 'gray']
+                bar_colors = [colors[i % len(colors)] for i in range(len(pattern_names))]
+                
+                p.vbar(x=pattern_names, top=pattern_props, width=0.5, color=bar_colors, alpha=0.7)
+                p.xaxis.major_label_orientation = 45
+                
+                layout = column(p)
+        
+        # Save the plot
+        self.output_bokeh_plot(layout, save_path=save_path, 
+                              title="Coactivation Patterns Analysis",
+                              notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return layout
+    
+    def plot_connectivity_mutual_information(self, bins=10, save_path=None, notebook=False,
+                                           overwrite=False, font_size=None):
+        """
+        Generate mutual information analysis plot
+        
+        Parameters:
+        -----------
+        bins : int
+            Number of bins for mutual information calculation
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Run mutual information analysis
+        mi_results = connectivity.run_mutual_information_analysis(bins=bins)
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_mutual_information.html')
+        
+        # Create visualization of mutual information
+        from bokeh.plotting import figure
+        from bokeh.layouts import column
+        import numpy as np
+        
+        if not mi_results:
+            # Create empty plot if no data
+            p = figure(width=600, height=400, title="No Mutual Information Data Available")
+            p.grid.grid_line_color = None
+            p.text([0.5], [0.5], ["No mutual information data available"], 
+                   text_align="center", text_baseline="middle")
+            p.axis.visible = False
+            layout = column(p)
+        else:
+            # Create bar plot of mutual information
+            pairs = list(mi_results.keys())
+            mi_values = list(mi_results.values())
+            
+            p = figure(width=800, height=400,
+                      title=f"Mutual Information Analysis (Bins: {bins})",
+                      x_axis_label="Neuron Pair",
+                      y_axis_label="Mutual Information",
+                      tools="pan,box_zoom,wheel_zoom,reset,save")
+            
+            # Color code by MI value
+            colors = ['red' if mi < 0 else 'blue' for mi in mi_values]
+            
+            p.vbar(x=pairs, top=mi_values, width=0.5, color=colors, alpha=0.7)
+            p.xaxis.major_label_orientation = 45
+            
+            layout = column(p)
+        
+        # Save the plot
+        self.output_bokeh_plot(layout, save_path=save_path, 
+                              title="Mutual Information Analysis",
+                              notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return layout
+    
+    def plot_connectivity_time_window_comparison(self, time_windows=[5, 10, 20, 50], method='individual',
+                                               save_path=None, notebook=False, overwrite=False, font_size=None):
+        """
+        Generate a comparison plot showing conditional probabilities across different time windows
+        
+        Parameters:
+        -----------
+        time_windows : list
+            Different time window sizes (in samples)
+        method : str
+            'individual' - calculate probabilities between individual neurons
+            'population' - calculate probabilities between cell type populations
+            'cell_type_proportion' - calculate using average proportion of target neurons activated per source activation
+        save_path : str, optional
+            Path to save the HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        
+        Returns:
+        --------
+        bokeh.layouts.layout : The created plot layout
+        """
+        connectivity = self.create_connectivity_analyzer()
+        
+        # Run conditional probabilities analysis
+        cond_prob_results = connectivity.run_conditional_probabilities_analysis(
+            time_windows=time_windows, 
+            method=method
+        )
+        
+        # Set default save path if none provided
+        if save_path is None:
+            save_path = os.path.join(self.config["SummaryPlotsPath"], 
+                                   self.session_name, 
+                                   'connectivity_time_window_comparison.html')
+        
+        # Create comparison visualization
+        from bokeh.plotting import figure
+        from bokeh.layouts import column
+        import numpy as np
+        
+        # Extract data for comparison
+        window_sizes = []
+        connection_types = set()
+        all_probabilities = {}
+        
+        for window_key in cond_prob_results.keys():
+            window_size = int(window_key.split('_')[1])
+            window_sizes.append(window_size)
+            probs = cond_prob_results[window_key]
+            
+            for connection, prob in probs.items():
+                if (connection.endswith('_to_D1') or connection.endswith('_to_D2') or 
+                    connection.endswith('_to_CHI')) and isinstance(prob, (int, float, np.integer, np.floating)):
+                    connection_types.add(connection)
+                    if connection not in all_probabilities:
+                        all_probabilities[connection] = []
+                    all_probabilities[connection].append(prob)
+        
+        if not all_probabilities:
+            # Create empty plot if no data
+            p = figure(width=600, height=400, title="No Conditional Probability Data Available")
+            p.grid.grid_line_color = None
+            p.text([0.5], [0.5], ["No conditional probability data available"], 
+                   text_align="center", text_baseline="middle")
+            p.axis.visible = False
+            layout = column(p)
+        else:
+            # Create line plot showing how probabilities change with window size
+            p = figure(width=1000, height=600,
+                      title="Conditional Probabilities vs Time Window Size",
+                      x_axis_label="Time Window Size (samples)",
+                      y_axis_label="Conditional Probability",
+                      tools="pan,box_zoom,wheel_zoom,reset,save")
+            
+            # Color scheme for different connection types
+            colors = ['green', 'navy', 'crimson', 'orange', 'purple', 'brown']
+            color_map = {}
+            
+            for i, conn_type in enumerate(sorted(connection_types)):
+                color_map[conn_type] = colors[i % len(colors)]
+                
+                if conn_type in all_probabilities and len(all_probabilities[conn_type]) == len(window_sizes):
+                    # Convert window sizes to time (assuming 20Hz sampling rate)
+                    time_seconds = [ws / 20.0 for ws in window_sizes]
+                    
+                    p.line(time_seconds, all_probabilities[conn_type], 
+                          line_width=3, color=color_map[conn_type], 
+                          legend_label=conn_type, alpha=0.8)
+                    p.scatter(time_seconds, all_probabilities[conn_type], 
+                           size=8, color=color_map[conn_type], alpha=0.8)
+            
+            p.legend.location = "top_left"
+            p.legend.click_policy = "hide"
+            
+            layout = column(p)
+        
+        # Save the plot
+        self.output_bokeh_plot(layout, save_path=save_path, 
+                              title="Time Window Comparison Analysis",
+                              notebook=notebook, overwrite=overwrite, font_size=font_size)
+        
+        return layout
+    
     def _plot_population_centered_activity_core(self, center_cell_type, center_signals, center_peak_indices,
                                                all_signals_dict, ci_rate=None, time_window=3.0,
-                                               save_path=None, title=None, notebook=False, overwrite=False, font_size=None):
+                                               save_path=None, title=None, notebook=False, overwrite=False, font_size=None,
+                                               baseline_correct=False, correction_factors=None, exclude_indices=None):
         """
         Core function for plotting population-centered activity analysis where ALL neurons from each cell type
         are averaged at the center cell type peak times (no activity filtering).
@@ -4708,6 +4446,13 @@ class CellTypeTank(CITank):
             Whether to overwrite existing file
         font_size : str, optional
             Font size for plot text elements
+        baseline_correct : bool
+            Whether to apply baseline correction
+        correction_factors : dict, optional
+            Dictionary of correction factors for each cell type {'D1': factor, 'D2': factor, 'CHI': factor}
+        exclude_indices : array-like, optional
+            Binary array or list of indices to exclude from analysis. If binary array, indices where value is 1 (or True) will be excluded.
+            If list of indices, those specific indices will be excluded. Can be used to exclude timepoints during licking, movement, etc.
         
         Returns:
         --------
@@ -4721,14 +4466,30 @@ class CellTypeTank(CITank):
         if ci_rate is None:
             ci_rate = self.ci_rate
         
+        if correction_factors is None:
+            correction_factors = {'D1': 0, 'D2': 0, 'CHI': 0}
+        
         # Convert time window to samples
         plot_window_samples = int(time_window * ci_rate)
         
-        # Collect all center peak time indices
+        # Process exclude_indices to create exclusion set
+        exclusion_set = set()
+        if exclude_indices is not None:
+            exclude_indices = np.array(exclude_indices)
+            if exclude_indices.dtype == bool or all(val in [0, 1, True, False] for val in exclude_indices):
+                # Binary array - get indices where value is True/1
+                exclusion_set = set(np.where(exclude_indices)[0])
+            else:
+                # List of indices
+                exclusion_set = set(exclude_indices)
+            print(f"Excluding {len(exclusion_set)} time indices from {center_cell_type} analysis")
+        
+        # Collect all center peak time indices, excluding those in exclusion_set
         all_center_peak_times = []
         for neuron_idx, peaks in enumerate(center_peak_indices):
             for peak_idx in peaks:
-                all_center_peak_times.append(peak_idx)
+                if peak_idx not in exclusion_set:
+                    all_center_peak_times.append(peak_idx)
         
         if not all_center_peak_times:
             print(f"No {center_cell_type} peaks found for analysis.")
@@ -4806,10 +4567,48 @@ class CellTypeTank(CITank):
             if all_cell_type_traces[cell_type]:
                 final_avg_traces[cell_type] = np.mean(all_cell_type_traces[cell_type], axis=0)
                 final_sem_traces[cell_type] = np.std(all_cell_type_traces[cell_type], axis=0) / np.sqrt(len(all_cell_type_traces[cell_type]))
+                
+                # Apply baseline correction if requested
+                if baseline_correct and cell_type in correction_factors:
+                    correction_factor = correction_factors[cell_type]
+                    final_avg_traces[cell_type] += correction_factor
+                    # Note: SEM doesn't need correction as it's a relative measure
+                    print(f"Applied baseline correction to {cell_type}: {correction_factor:.4f}")
             else:
                 trace_length = 2 * plot_window_samples + 1
                 final_avg_traces[cell_type] = np.zeros(trace_length)
                 final_sem_traces[cell_type] = np.zeros(trace_length)
+        
+        # Calculate peak times for each cell type within the time window
+        print(f"\n=== PEAK TIMING ANALYSIS FOR {center_cell_type}-CENTERED POPULATION ===")
+        time_axis = np.linspace(-time_window, time_window, 2 * plot_window_samples + 1)
+        
+        for cell_type in final_avg_traces.keys():
+            if len(final_avg_traces[cell_type]) > 0:
+                # Find the peak within the time window
+                peak_idx = np.argmax(final_avg_traces[cell_type])
+                peak_time = time_axis[peak_idx]
+                peak_value = final_avg_traces[cell_type][peak_idx]
+                
+                print(f"{cell_type} Population Peak:")
+                print(f"  - Peak Time: {peak_time:.3f} seconds (relative to {center_cell_type} peak)")
+                print(f"  - Peak Value: {peak_value:.4f}")
+                print(f"  - Peak Index: {peak_idx}/{len(time_axis)-1} (time window samples)")
+                
+                # Also find the time when signal first exceeds 50% of peak
+                half_peak = peak_value * 0.5
+                above_half = final_avg_traces[cell_type] > half_peak
+                if np.any(above_half):
+                    first_half_idx = np.where(above_half)[0][0]
+                    last_half_idx = np.where(above_half)[0][-1]
+                    first_half_time = time_axis[first_half_idx]
+                    last_half_time = time_axis[last_half_idx]
+                    duration = last_half_time - first_half_time
+                    print(f"  - Half-peak Duration: {duration:.3f} seconds ({first_half_time:.3f} to {last_half_time:.3f})")
+            else:
+                print(f"{cell_type} Population: No valid traces available")
+        
+        print("=" * 60)
         
         # Calculate average velocity trace
         avg_velocity_trace = None
@@ -4826,16 +4625,48 @@ class CellTypeTank(CITank):
             f'total_{center_cell_type.lower()}_peaks': len(all_center_peak_times),
             'valid_peaks_analyzed': valid_peak_count,
             'n_traces_averaged': valid_peak_count,
-            'has_velocity': has_velocity
+            'has_velocity': has_velocity,
+            'baseline_corrected': baseline_correct,
+            'excluded_indices_count': len(exclusion_set) if exclude_indices is not None else 0
         }
+        
+        # Add baseline correction info to stats
+        if baseline_correct:
+            stats['correction_factors'] = correction_factors.copy()
         
         # Add neuron counts for each cell type
         for cell_type, signals in all_signals_dict.items():
             stats[f'n_{cell_type.lower()}_neurons'] = len(signals)
         
+        # Calculate peak times for each cell type first
+        peak_times = {}  # Store peak times for annotation
+        for cell_type in final_avg_traces.keys():
+            if len(final_avg_traces[cell_type]) > 0:
+                # Find the peak within the time window
+                peak_idx = np.argmax(final_avg_traces[cell_type])
+                peak_time = time_axis[peak_idx]
+                peak_value = final_avg_traces[cell_type][peak_idx]
+                peak_times[cell_type] = (peak_time, peak_value)
+        
         # Create the plot
         plot_title = (f"{title or f'{center_cell_type}-Centered Population Analysis'}\n"
                       f"All neurons averaged at {center_cell_type} peak times (n={valid_peak_count} peaks)")
+        if baseline_correct:
+            plot_title += " - Baseline Corrected"
+        
+        # Add peak timing information to title
+        peak_info = []
+        if peak_times:  # Check if peak_times is not empty
+            for cell_type, (peak_time, peak_value) in peak_times.items():
+                peak_info.append(f"{cell_type}: {peak_time:.2f}s")
+            if peak_info:
+                plot_title += f"\nPeak Times: {', '.join(peak_info)}"
+        
+        # Add velocity peak info if available
+        if has_velocity and avg_velocity_trace is not None:
+            vel_peak_idx = np.argmax(avg_velocity_trace)
+            vel_peak_time = time_axis[vel_peak_idx]
+            plot_title += f", Vel: {vel_peak_time:.2f}s"
         
         # Calculate neuron signal range for left y-axis
         all_neuron_values = []
@@ -4869,20 +4700,40 @@ class CellTypeTank(CITank):
         colors = {'D1': 'blue', 'D2': 'red', 'CHI': 'green'}
         
         # Plot traces for each cell type (on left y-axis)
+        # First, plot all population averages
         for cell_type in all_signals_dict.keys():
-            if cell_type in final_avg_traces:
+            if cell_type in final_avg_traces and len(final_avg_traces[cell_type]) > 0:
                 color = colors.get(cell_type, 'black')
                 line_width = 3 if cell_type == center_cell_type else 2
                 
+                # Create legend label for population average
+                legend_label = f"{cell_type} Population Avg"
+                if baseline_correct and cell_type in correction_factors:
+                    correction = correction_factors[cell_type]                
                 # Main line (explicitly on default y-axis)
                 p.line(time_axis, final_avg_traces[cell_type], line_width=line_width, color=color, 
-                       legend_label=f"{cell_type} Population Avg (n={stats[f'n_{cell_type.lower()}_neurons']} neurons)")
+                       legend_label=legend_label)
                 
                 # SEM patch (explicitly on default y-axis)
                 p.patch(np.concatenate([time_axis, time_axis[::-1]]), 
                         np.concatenate([final_avg_traces[cell_type] - final_sem_traces[cell_type], 
                                       (final_avg_traces[cell_type] + final_sem_traces[cell_type])[::-1]]),
                         alpha=0.2, color=color)
+            else:
+                # If no valid traces for this cell type, skip plotting
+                continue
+        
+        # Then, plot all peak markers
+        for cell_type in all_signals_dict.keys():
+            if cell_type in final_avg_traces and len(final_avg_traces[cell_type]) > 0:
+                color = colors.get(cell_type, 'black')
+                
+                # Get peak time for this cell type (already calculated above)
+                peak_time, peak_value = peak_times.get(cell_type, (0, 0))
+                
+                # Add peak marker
+                p.scatter([peak_time], [peak_value], size=8, color=color, fill_color=color, 
+                        legend_label=f"{cell_type} Peak")
         
         # Add velocity trace with secondary y-axis if available
         if has_velocity and avg_velocity_trace is not None:
@@ -4907,25 +4758,84 @@ class CellTypeTank(CITank):
             velocity_axis.minor_tick_line_color = "orange"
             p.add_layout(velocity_axis, 'right')
             
-            # Plot velocity trace (explicitly on velocity y-axis)
+            # Find velocity peak time
+            vel_peak_idx = np.argmax(avg_velocity_trace)
+            vel_peak_time = time_axis[vel_peak_idx]
+            vel_peak_value = avg_velocity_trace[vel_peak_idx]
+            
+            # Plot velocity trace (explicitly on velocity y-axis) - add after population averages
             p.line(time_axis, avg_velocity_trace, line_width=2, color='orange', 
                    y_range_name="velocity_axis", alpha=0.8,
-                   legend_label="Smoothed Velocity")
+                   legend_label=f"Smoothed Velocity [Peak: {vel_peak_time:.2f}s]")
             
             # Add velocity SEM patch (explicitly on velocity y-axis)
             p.patch(np.concatenate([time_axis, time_axis[::-1]]), 
                     np.concatenate([avg_velocity_trace - sem_velocity_trace, 
                                   (avg_velocity_trace + sem_velocity_trace)[::-1]]),
                     alpha=0.1, color='orange', y_range_name="velocity_axis")
+            
+            # Add velocity peak marker - add after all other peaks
+            p.scatter([vel_peak_time], [vel_peak_value], size=8, color='orange', fill_color='orange',
+                    y_range_name="velocity_axis", legend_label="Velocity Peak")
         
         # Add vertical line at peak time (t=0) - spans the neuron y-axis range
         p.line([0, 0], [neuron_y_min, neuron_y_max], 
                line_width=3, color='black', line_dash='dashed', alpha=0.8,
                legend_label="Peak Time (t=0)")
         
-        # Configure legend
+        # Configure legend with custom ordering
         p.legend.location = "top_right"
         p.legend.click_policy = "hide"
+        
+        # Reorder legend items to group population averages first, then peaks
+        legend_items = p.legend.items
+        if legend_items:
+            # Separate items by type
+            population_items = []
+            peak_items = []
+            velocity_items = []
+            other_items = []
+            
+            for item in legend_items:
+                label = item.label.value
+                if "Population Avg" in label:
+                    population_items.append(item)
+                elif "Peak" in label:
+                    peak_items.append(item)
+                elif "Velocity" in label:
+                    velocity_items.append(item)
+                else:
+                    other_items.append(item)
+            
+            # Reorder: population averages first, then peaks, then velocity, then others
+            reordered_items = population_items + peak_items + velocity_items + other_items
+            
+            # Update legend with reordered items
+            p.legend.items = reordered_items
+        
+        # Add peak timing summary text to the plot
+        from bokeh.models import Label
+        
+        # Create summary text
+        summary_text = f"Peak Timing Summary:\n"
+        if peak_times:  # Check if peak_times is not empty
+            for cell_type, (peak_time, peak_value) in peak_times.items():
+                summary_text += f"{cell_type}: {peak_time:.2f}s ({peak_value:.3f})\n"
+        else:
+            summary_text += "No valid peaks found\n"
+        if has_velocity and avg_velocity_trace is not None:
+            vel_peak_idx = np.argmax(avg_velocity_trace)
+            vel_peak_time = time_axis[vel_peak_idx]
+            vel_peak_value = avg_velocity_trace[vel_peak_idx]
+            summary_text += f"Velocity: {vel_peak_time:.2f}s ({vel_peak_value:.1f} cm/s)"
+        
+        # Add text annotation to the plot
+        peak_label = Label(x=time_axis[0] + 0.1, y=neuron_y_max * 0.9, 
+                          text=summary_text, text_font_size='10pt',
+                          text_color='black', background_fill_color='white',
+                          background_fill_alpha=0.8, border_line_color='gray',
+                          border_line_width=1)
+        p.add_layout(peak_label)
         
         # Print summary statistics
         print(f"\n{center_cell_type}-Centered Population Analysis Summary:")
@@ -4946,7 +4856,8 @@ class CellTypeTank(CITank):
 
     def plot_population_centered_activity(self, center_cell_type='D1', signal_type='zsc',
                                          time_window=3.0, save_path=None, title=None, 
-                                         notebook=False, overwrite=False, font_size=None):
+                                         notebook=False, overwrite=False, font_size=None,
+                                         baseline_correct=False, correction_factors=None, exclude_indices=None):
         """
         Plot population-centered activity analysis where ALL neurons from each cell type
         are averaged at the center cell type peak times (no activity filtering).
@@ -4972,6 +4883,13 @@ class CellTypeTank(CITank):
             Whether to overwrite existing file
         font_size : str, optional
             Font size for plot text elements
+        baseline_correct : bool
+            Whether to apply baseline correction
+        correction_factors : dict, optional
+            Dictionary of correction factors for each cell type {'D1': factor, 'D2': factor, 'CHI': factor}
+        exclude_indices : array-like, optional
+            Binary array or list of indices to exclude from analysis. If binary array, indices where value is 1 (or True) will be excluded.
+            If list of indices, those specific indices will be excluded. Can be used to exclude timepoints during licking, movement, etc.
         
         Returns:
         --------
@@ -5032,11 +4950,15 @@ class CellTypeTank(CITank):
             title=title,
             notebook=notebook,
             overwrite=overwrite,
-            font_size=font_size
+            font_size=font_size,
+            baseline_correct=baseline_correct,
+            correction_factors=correction_factors,
+            exclude_indices=exclude_indices
         )
 
     def plot_all_population_centered_analyses(self, signal_type='zsc', time_window=3.0,
-                                             save_path=None, notebook=False, overwrite=False, font_size=None):
+                                             save_path=None, notebook=False, overwrite=False, font_size=None,
+                                             baseline_correct=True, baseline_window=(-3.0, -1.0), exclude_indices=None):
         """
         Comprehensive function to plot all three population-centered analyses (D1, D2, CHI) for comparison.
         
@@ -5057,6 +4979,13 @@ class CellTypeTank(CITank):
             Whether to overwrite existing file
         font_size : str, optional
             Font size for plot text elements
+        baseline_correct : bool
+            Whether to apply baseline correction to unify baseline levels across cell types
+        baseline_window : tuple
+            Time window (start, end) in seconds for baseline calculation (relative to peak time)
+        exclude_indices : array-like, optional
+            Binary array or list of indices to exclude from analysis. If binary array, indices where value is 1 (or True) will be excluded.
+            If list of indices, those specific indices will be excluded. Can be used to exclude timepoints during licking, movement, etc.
         
         Returns:
         --------
@@ -5065,12 +4994,125 @@ class CellTypeTank(CITank):
         """
         from bokeh.layouts import column
         from bokeh.io import output_file, save
+        import numpy as np
         
         results = {}
         signal_description = 'Z-score' if signal_type == 'zsc' else 'Denoised'
         
+        # Process exclude_indices to create exclusion set
+        exclusion_set = set()
+        if exclude_indices is not None:
+            exclude_indices = np.array(exclude_indices)
+            if exclude_indices.dtype == bool or all(val in [0, 1, True, False] for val in exclude_indices):
+                # Binary array - get indices where value is True/1
+                exclusion_set = set(np.where(exclude_indices)[0])
+            else:
+                # List of indices
+                exclusion_set = set(exclude_indices)
+            print(f"Excluding {len(exclusion_set)} time indices from analysis")
+        
+        # First pass: collect all traces to calculate global baseline correction
+        all_traces = {'D1': [], 'D2': [], 'CHI': []}
+        
+        if baseline_correct:
+            print(f"Calculating baseline correction factors...")
+            
+            # Get signals based on type
+            if signal_type == 'zsc':
+                d1_signals = self.d1_zsc
+                d2_signals = self.d2_zsc
+                chi_signals = self.chi_zsc
+            elif signal_type == 'denoised':
+                d1_signals = self.d1_denoised
+                d2_signals = self.d2_denoised
+                chi_signals = self.chi_denoised
+            else:
+                raise ValueError("signal_type must be 'zsc' or 'denoised'")
+            
+            # Get peak indices
+            d1_peak_indices = self.d1_peak_indices if hasattr(self, 'd1_peak_indices') else []
+            d2_peak_indices = self.d2_peak_indices if hasattr(self, 'd2_peak_indices') else []
+            chi_peak_indices = self.chi_peak_indices if hasattr(self, 'chi_peak_indices') else []
+            
+            all_signals_dict = {
+                'D1': d1_signals,
+                'D2': d2_signals, 
+                'CHI': chi_signals
+            }
+            
+            all_peak_indices_dict = {
+                'D1': d1_peak_indices,
+                'D2': d2_peak_indices,
+                'CHI': chi_peak_indices
+            }
+            
+            # Calculate average traces for each cell type across all analysis types
+            for center_type in ['D1', 'D2', 'CHI']:
+                center_peak_indices = all_peak_indices_dict[center_type]
+                
+                # Collect all center peak times, excluding those in exclusion_set
+                all_center_peak_times = []
+                for neuron_idx, peaks in enumerate(center_peak_indices):
+                    for peak_idx in peaks:
+                        if peak_idx not in exclusion_set:
+                            all_center_peak_times.append(peak_idx)
+                
+                if all_center_peak_times:
+                    plot_window_samples = int(time_window * self.ci_rate)
+                    
+                    # Collect traces for each cell type at center peak times
+                    for cell_type, signals in all_signals_dict.items():
+                        if len(signals) > 0:
+                            cell_type_traces = []
+                            for peak_idx in all_center_peak_times:
+                                start_idx = peak_idx - plot_window_samples
+                                end_idx = peak_idx + plot_window_samples + 1
+                                
+                                # Check bounds
+                                if start_idx >= 0 and end_idx < len(signals[0]):
+                                    # Average all neurons of this cell type at this peak time
+                                    traces_at_peak = [neuron_signal[start_idx:end_idx] for neuron_signal in signals]
+                                    avg_trace_at_peak = np.mean(traces_at_peak, axis=0)
+                                    cell_type_traces.append(avg_trace_at_peak)
+                            
+                            if cell_type_traces:
+                                # Calculate final average trace for this cell type in this analysis
+                                final_avg_trace = np.mean(cell_type_traces, axis=0)
+                                all_traces[cell_type].append(final_avg_trace)
+            
+            # Calculate baseline values for each cell type
+            baseline_corrections = {}
+            time_axis = np.linspace(-time_window, time_window, 2 * int(time_window * self.ci_rate) + 1)
+            baseline_mask = (time_axis >= baseline_window[0]) & (time_axis <= baseline_window[1])
+            
+            for cell_type in ['D1', 'D2', 'CHI']:
+                if all_traces[cell_type]:
+                    # Calculate average baseline across all analysis types for this cell type
+                    all_baselines = []
+                    for trace in all_traces[cell_type]:
+                        baseline_value = np.mean(trace[baseline_mask])
+                        all_baselines.append(baseline_value)
+                    baseline_corrections[cell_type] = np.mean(all_baselines)
+                else:
+                    baseline_corrections[cell_type] = 0.0
+            
+            # Calculate the target baseline (minimum baseline to shift all to)
+            target_baseline = min(baseline_corrections.values()) if baseline_corrections else 0.0
+            
+            print(f"Baseline values: D1={baseline_corrections.get('D1', 0):.4f}, "
+                  f"D2={baseline_corrections.get('D2', 0):.4f}, CHI={baseline_corrections.get('CHI', 0):.4f}")
+            print(f"Target baseline: {target_baseline:.4f}")
+            
+            # Calculate correction factors
+            correction_factors = {}
+            for cell_type in ['D1', 'D2', 'CHI']:
+                correction_factors[cell_type] = target_baseline - baseline_corrections.get(cell_type, 0)
+                print(f"{cell_type} correction factor: {correction_factors[cell_type]:.4f}")
+        else:
+            correction_factors = {'D1': 0, 'D2': 0, 'CHI': 0}
+        
         # D1-centered population analysis
-        print(f"Running D1-centered population analysis ({signal_description})...")
+        print(f"\nRunning D1-centered population analysis ({signal_description})...")
         d1_plot, d1_stats = self.plot_population_centered_activity(
             center_cell_type='D1',
             signal_type=signal_type,
@@ -5079,7 +5121,10 @@ class CellTypeTank(CITank):
             title=f"D1-Centered Population Analysis: All Neurons Averaged ({signal_description})",
             notebook=False,  # Don't display individual plots
             overwrite=overwrite,
-            font_size=font_size
+            font_size=font_size,
+            baseline_correct=baseline_correct,
+            correction_factors=correction_factors,
+            exclude_indices=exclude_indices
         )
         results['d1_population'] = {'plot': d1_plot, 'stats': d1_stats}
         
@@ -5093,7 +5138,10 @@ class CellTypeTank(CITank):
             title=f"D2-Centered Population Analysis: All Neurons Averaged ({signal_description})",
             notebook=False,  # Don't display individual plots
             overwrite=overwrite,
-            font_size=font_size
+            font_size=font_size,
+            baseline_correct=baseline_correct,
+            correction_factors=correction_factors,
+            exclude_indices=exclude_indices
         )
         results['d2_population'] = {'plot': d2_plot, 'stats': d2_stats}
         
@@ -5107,13 +5155,20 @@ class CellTypeTank(CITank):
             title=f"CHI-Centered Population Analysis: All Neurons Averaged ({signal_description})",
             notebook=False,  # Don't display individual plots
             overwrite=overwrite,
-            font_size=font_size
+            font_size=font_size,
+            baseline_correct=baseline_correct,
+            correction_factors=correction_factors,
+            exclude_indices=exclude_indices
         )
         results['chi_population'] = {'plot': chi_plot, 'stats': chi_stats}
         
         # Print comparative summary
         print("\n" + "="*80)
         print(f"POPULATION-LEVEL COMPARATIVE ANALYSIS SUMMARY ({signal_description})")
+        if baseline_correct:
+            print("*** BASELINE CORRECTED FOR UNIFIED COMPARISON ***")
+        if exclude_indices is not None:
+            print(f"*** {len(exclusion_set)} TIME INDICES EXCLUDED FROM ANALYSIS ***")
         print("="*80)
         
         if d1_stats and d2_stats and chi_stats:
@@ -5127,11 +5182,38 @@ class CellTypeTank(CITank):
             print(f"  CHI neurons: {d1_stats['n_chi_neurons']}")
             
             print(f"\nNote: All neurons of each type were included in averaging (no activity filtering)")
+            if baseline_correct:
+                print(f"Baseline correction applied using window {baseline_window} seconds relative to peak")
+            if exclude_indices is not None:
+                print(f"Excluded {len(exclusion_set)} time indices from peak analysis")
+        
+        # Add comprehensive peak timing summary
+        print(f"\n" + "="*60)
+        print(f"COMPREHENSIVE PEAK TIMING SUMMARY")
+        print("="*60)
+        print(f"Time window: ±{time_window} seconds around each center cell type peak")
+        print(f"Signal type: {signal_description}")
+        print(f"Analysis includes all neurons of each type (no activity filtering)")
+        if baseline_correct:
+            print(f"Baseline correction: Applied using window {baseline_window} seconds")
+        if exclude_indices is not None:
+            print(f"Excluded timepoints: {len(exclusion_set)} indices")
+        
+        print(f"\nExpected peak timing patterns:")
+        print(f"- D1-centered analysis: D1 peak should be at t=0, D2/CHI peaks may be delayed")
+        print(f"- D2-centered analysis: D2 peak should be at t=0, D1/CHI peaks may be delayed") 
+        print(f"- CHI-centered analysis: CHI peak should be at t=0, D1/D2 peaks may be delayed")
+        print(f"- Velocity peaks typically occur before neural peaks (anticipatory movement)")
+        print("="*60)
         
         # Create and save combined analysis
         if all([d1_plot, d2_plot, chi_plot]):
             combined_layout = column(d1_plot, d2_plot, chi_plot)
             combined_title = f"All Population-Centered Analyses ({signal_description})"
+            if baseline_correct:
+                combined_title += " - Baseline Corrected"
+            if exclude_indices is not None:
+                combined_title += f" - Excluded {len(exclusion_set)} indices"
             
             # Output the combined plot
             self.output_bokeh_plot(combined_layout, save_path=save_path, title=combined_title, 
@@ -5251,4 +5333,93 @@ class CellTypeTank(CITank):
             notebook=notebook,
             overwrite=overwrite,
             font_size=font_size
+        )
+
+    def plot_all_population_centered_analyses_unified_baseline(self, signal_type='zsc', time_window=3.0,
+                                                              baseline_window=(-3.0, -1.0),
+                                                              save_path=None, notebook=False, overwrite=False, font_size=None, exclude_indices=None):
+        """
+        Convenience function to plot all population-centered analyses with unified baseline correction.
+        
+        This function automatically applies baseline correction to ensure all cell types (D1, D2, CHI) 
+        have the same baseline level for easy comparison.
+        
+        Parameters:
+        -----------
+        signal_type : str
+            Type of signal to use ('zsc' for z-score normalized, 'denoised' for denoised signals)
+        time_window : float
+            Time window in seconds before and after each peak for plotting
+        baseline_window : tuple
+            Time window (start, end) in seconds for baseline calculation (relative to peak time)
+        save_path : str, optional
+            Path to save the combined HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        exclude_indices : array-like, optional
+            Binary array or list of indices to exclude from analysis. If binary array, indices where value is 1 (or True) will be excluded.
+            If list of indices, those specific indices will be excluded. Can be used to exclude timepoints during licking, movement, etc.
+        
+        Returns:
+        --------
+        dict
+            Dictionary containing plots and statistics for all three analyses with unified baselines
+        """
+        print("Creating population-centered analyses with unified baseline...")
+        return self.plot_all_population_centered_analyses(
+            signal_type=signal_type,
+            time_window=time_window,
+            save_path=save_path,
+            notebook=notebook,
+            overwrite=overwrite,
+            font_size=font_size,
+            baseline_correct=True,
+            baseline_window=baseline_window,
+            exclude_indices=exclude_indices
+        )
+
+    def plot_all_population_centered_analyses_no_baseline_correction(self, signal_type='zsc', time_window=3.0,
+                                                                   save_path=None, notebook=False, overwrite=False, font_size=None, exclude_indices=None):
+        """
+        Convenience function to plot all population-centered analyses without baseline correction.
+        
+        This function creates the original analyses without any baseline modification.
+        
+        Parameters:
+        -----------
+        signal_type : str
+            Type of signal to use ('zsc' for z-score normalized, 'denoised' for denoised signals)
+        time_window : float
+            Time window in seconds before and after each peak for plotting
+        save_path : str, optional
+            Path to save the combined HTML file
+        notebook : bool
+            Whether to display in notebook
+        overwrite : bool
+            Whether to overwrite existing file
+        font_size : str, optional
+            Font size for plot text elements
+        exclude_indices : array-like, optional
+            Binary array or list of indices to exclude from analysis. If binary array, indices where value is 1 (or True) will be excluded.
+            If list of indices, those specific indices will be excluded. Can be used to exclude timepoints during licking, movement, etc.
+        
+        Returns:
+        --------
+        dict
+            Dictionary containing plots and statistics for all three analyses without baseline correction
+        """
+        print("Creating population-centered analyses without baseline correction...")
+        return self.plot_all_population_centered_analyses(
+            signal_type=signal_type,
+            time_window=time_window,
+            save_path=save_path,
+            notebook=notebook,
+            overwrite=overwrite,
+            font_size=font_size,
+            baseline_correct=False,
+            exclude_indices=exclude_indices
         )
