@@ -5,6 +5,10 @@ import json
 import os
 from .VirmenTank import VirmenTank
 from scipy.signal import savgol_filter
+import oasis
+from oasis.functions import gen_data, gen_sinusoidal_data, deconvolve, estimate_parameters
+from oasis.plotting import simpleaxis
+from oasis.oasis_methods import oasisAR1, oasisAR2
 
 
 class CITank(VirmenTank):
@@ -56,6 +60,7 @@ class CITank(VirmenTank):
         self.ca_all = self.normalize_signal(self.shift_signal_single(np.mean(self.C_zsc, axis=0)))
         self.peak_indices = self._find_peaks_in_traces()
         self.rising_edges_starts = self._find_rising_edges_starts()
+        self.C_denoised = self.oasis_denoised()
         
 
     @staticmethod
@@ -130,6 +135,14 @@ class CITank(VirmenTank):
             signals[i] = self.z_score_normalize(self.C_raw[i])
 
         return signals
+    
+    def oasis_denoised(self, penalty=1):
+        """Use OASIS to deconvolve calcium traces"""
+        C_denoised = np.zeros_like(self.C_zsc)
+        for i in range(len(C_denoised)):
+            c, s, b, g_out, lam = deconvolve(self.C_zsc[i], penalty=penalty, b_nonneg = False)
+            C_denoised[i] = b + c
+        return C_denoised
 
     @staticmethod
     def find_outliers_indices(data, threshold=3.0):

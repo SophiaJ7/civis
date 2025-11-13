@@ -13,3 +13,4 @@ scikit-learn>=1.5.1
 scikit-image>=0.24.0
 opencv-python>=4.10.0
 tdt>=0.6.6
+oasis-deconv
